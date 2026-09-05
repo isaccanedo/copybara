@@ -1,0 +1,227 @@
+/*
+ * Copyright (C) 2018 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.copybara.git;
+
+import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
+
+import com.google.common.collect.ImmutableSet;
+import com.google.copybara.testing.DummyChecker;
+import com.google.copybara.testing.OptionsBuilder;
+import com.google.copybara.testing.SkylarkTestExecutor;
+import com.google.copybara.exception.ValidationException;
+import com.google.copybara.util.console.testing.TestingConsole;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.JUnit4;
+
+@RunWith(JUnit4.class)
+public class GerritTriggerTest {
+
+  private SkylarkTestExecutor skylarkTestExecutor;
+
+  @Before
+  public void setup() throws Exception {
+    TestingConsole console = new TestingConsole();
+    OptionsBuilder options = new OptionsBuilder();
+    options.setConsole(console).setOutputRootToTmpDir();
+    options.testingOptions.checker = new DummyChecker(ImmutableSet.of("badword"));
+    skylarkTestExecutor =
+        new SkylarkTestExecutor(options);
+  }
+
+  @Test
+  public void testParsing() throws Exception {
+    GerritTrigger gerritTrigger =
+        skylarkTestExecutor.eval(
+            "e",
+            """
+            e = git.gerrit_trigger(
+                url = 'https://test.googlesource.com/example',
+                events = ['LABELS'], allow_submit = True)
+            """);
+    assertThat(gerritTrigger.describe())
+        .containsExactly("type", "gerrit_trigger",
+          "url", "https://test.googlesource.com/example",
+                "events", "LABELS",
+                "gerritSubmit", "true");
+    assertThat(gerritTrigger.getEndpoint().describe())
+        .containsExactly("type", "gerrit_api",
+            "url", "https://test.googlesource.com/example",
+            "gerritSubmit", "true");
+  }
+
+  @Test
+  public void testParsing_statusPending() throws Exception {
+    GerritTrigger gerritTrigger =
+        skylarkTestExecutor.eval(
+            "e",
+            """
+            e = git.gerrit_trigger(
+                url = 'https://test.googlesource.com/example',
+                events = {'STATUS': ['PENDING'], 'LABELS': []}, allow_submit = True)
+            """);
+
+    assertThat(gerritTrigger.describe())
+        .containsExactly(
+            "type",
+            "gerrit_trigger",
+            "url",
+            "https://test.googlesource.com/example",
+            "events",
+            "STATUS",
+            "events",
+            "LABELS",
+            "SUBTYPES_STATUS",
+            "PENDING",
+            "gerritSubmit",
+            "true");
+  }
+
+  @Test
+  public void testParsing_statusAbandoned() throws Exception {
+    GerritTrigger gerritTrigger =
+        skylarkTestExecutor.eval(
+            "e",
+            """
+            e = git.gerrit_trigger(
+                url = 'https://test.googlesource.com/example',
+                events = {'STATUS': ['ABANDONED']}, allow_submit = True)
+            """);
+
+    assertThat(gerritTrigger.describe())
+        .containsExactly(
+            "type",
+            "gerrit_trigger",
+            "url",
+            "https://test.googlesource.com/example",
+            "events",
+            "STATUS",
+            "SUBTYPES_STATUS",
+            "ABANDONED",
+            "gerritSubmit",
+            "true");
+  }
+
+  @Test
+  public void testParsing_statusMultiple() throws Exception {
+    GerritTrigger gerritTrigger =
+        skylarkTestExecutor.eval(
+            "e",
+            """
+            e = git.gerrit_trigger(
+                url = 'https://test.googlesource.com/example',
+                events = {'STATUS': ['PENDING', 'ABANDONED']})
+            """);
+
+    assertThat(gerritTrigger.describe())
+        .containsExactly(
+            "type", "gerrit_trigger",
+            "url", "https://test.googlesource.com/example",
+            "events", "STATUS",
+            "SUBTYPES_STATUS", "PENDING",
+            "SUBTYPES_STATUS", "ABANDONED",
+            "gerritSubmit", "false");
+  }
+
+  @Test
+  public void testParsing_statusMultipleValid() throws Exception {
+    GerritTrigger gerritTrigger =
+        skylarkTestExecutor.eval(
+            "e",
+            """
+            e = git.gerrit_trigger(
+                url = 'https://test.googlesource.com/example',
+                events = {'STATUS': ['PENDING', 'ABANDONED', 'MERGED', 'CLOSED', 'REVIEWED', 'OPEN']})
+            """);
+
+    assertThat(gerritTrigger.describe())
+        .containsExactly(
+            "type", "gerrit_trigger",
+            "url", "https://test.googlesource.com/example",
+            "events", "STATUS",
+            "SUBTYPES_STATUS", "PENDING",
+            "SUBTYPES_STATUS", "ABANDONED",
+            "SUBTYPES_STATUS", "MERGED",
+            "SUBTYPES_STATUS", "CLOSED",
+            "SUBTYPES_STATUS", "REVIEWED",
+            "SUBTYPES_STATUS", "OPEN",
+            "gerritSubmit", "false");
+  }
+
+  @Test
+  public void testParsing_invalidStatus() throws Exception {
+    skylarkTestExecutor.evalFails(
+        "git.gerrit_trigger(url = 'https://test.googlesource.com/example', events = {'STATUS':"
+            + " ['INVALID']})",
+        "Invalid status 'INVALID'. Valid values are ");
+  }
+
+  @Test
+  public void testParsing_Dict() throws Exception {
+    GerritTrigger gerritTrigger =
+        skylarkTestExecutor.eval(
+            "e",
+            """
+            e = git.gerrit_trigger(
+                url = 'https://test.googlesource.com/example',
+                events = {'LABELS': ['foo', 'bar']},
+                allow_submit = False)
+            """);
+    assertThat(gerritTrigger.describe())
+        .containsExactly("type", "gerrit_trigger",
+          "url", "https://test.googlesource.com/example",
+                "events", "LABELS",
+                "SUBTYPES_LABELS", "foo",
+                "SUBTYPES_LABELS", "bar",
+                "gerritSubmit", "false");
+    assertThat(gerritTrigger.getEndpoint().describe())
+        .containsExactly("type", "gerrit_api",
+            "url", "https://test.googlesource.com/example",
+            "gerritSubmit", "false");
+  }
+
+  @Test
+  public void testParsingWithChecker() throws Exception {
+    GerritTrigger gerritTrigger =
+        skylarkTestExecutor.eval(
+            "e",
+            """
+            e = git.gerrit_trigger(
+                url = 'https://test.googlesource.com/example',
+                events = ['LABELS'],
+                checker = testing.dummy_checker(),
+                allow_submit = False
+            )
+            """);
+
+    assertThat(gerritTrigger.describe())
+        .containsExactly("type", "gerrit_trigger",
+          "url", "https://test.googlesource.com/example",
+          "events", "LABELS",
+          "gerritSubmit", "false");
+    assertThat(gerritTrigger.getEndpoint().describe())
+        .containsExactly("type", "gerrit_api", "url", "https://test.googlesource.com/example",
+            "gerritSubmit", "false");
+  }
+
+  @Test
+  public void testParsingEmptyUrl() {
+    skylarkTestExecutor.evalFails("git.gerrit_trigger(url = '')", "Invalid empty field 'url'");
+  }
+}

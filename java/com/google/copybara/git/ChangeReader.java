@@ -1,0 +1,377 @@
+/*
+ * Copyright (C) 2016 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.copybara.git;
+
+import static com.google.common.base.Preconditions.checkNotNull;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
+
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableListMultimap;
+import com.google.common.collect.ImmutableMap;
+import com.google.copybara.ChangeMessage;
+import com.google.copybara.authoring.Author;
+import com.google.copybara.authoring.Authoring;
+import com.google.copybara.exception.RepoException;
+import com.google.copybara.exception.ValidationException;
+import com.google.copybara.git.GitRepository.GitLogEntry;
+import com.google.copybara.git.GitRepository.LogCmd;
+import com.google.copybara.revision.Change;
+import com.google.copybara.util.Glob;
+import com.google.copybara.util.console.Console;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import java.util.List;
+import javax.annotation.Nullable;
+import net.starlark.java.eval.EvalException;
+
+/**
+ * Utility class to introspect the log of a Git repository.
+ */
+class ChangeReader {
+
+  @Nullable private final Authoring authoring;
+  private final GitRepository repository;
+  private final int limit;
+  private final ImmutableList<String> roots;
+  private final boolean includeBranchCommitLogs;
+  private final String url;
+  private final boolean firstParent;
+  private final boolean partialFetch;
+  private final boolean topoOrder;
+  private final int skip;
+  private final int batchSize;
+
+  @Nullable private final String grepString;
+  private final ImmutableMap<String, String> lastRevisionMap;
+
+  private ChangeReader(
+      @Nullable Authoring authoring,
+      GitRepository repository,
+      int limit,
+      Iterable<String> roots,
+      boolean includeBranchCommitLogs,
+      @Nullable String url,
+      boolean firstParent,
+      boolean partialFetch,
+      boolean topoOrder,
+      int skip,
+      int batchSize,
+      @Nullable String grepString,
+      ImmutableMap<String, String> lastRevisionMap) {
+    this.authoring = authoring;
+    this.repository = checkNotNull(repository, "repository");
+    this.limit = limit;
+    this.roots = ImmutableList.copyOf(roots);
+    this.includeBranchCommitLogs = includeBranchCommitLogs;
+    this.url = url;
+    this.firstParent = firstParent;
+    this.partialFetch = partialFetch;
+    this.topoOrder = topoOrder;
+    this.skip = skip;
+    this.batchSize = batchSize;
+    this.grepString = grepString;
+    this.lastRevisionMap = checkNotNull(lastRevisionMap);
+  }
+
+  ImmutableList<Change<GitRevision>> run(GitRevision revision)
+      throws RepoException, ValidationException {
+    return run(null, revision, false, ImmutableMap.of());
+  }
+
+  /**
+   * Computes a list of changes from the {@code refExpression} and propagates labels contained in
+   * {@code labels} onto the resulting change list.
+   *
+   * @param fromRev the revision representing the start of the search range. If not provided, only
+   *     toRev will be looked up
+   * @param toRev the revision representing the end of the search range.
+   * @param historyIsNonLinear read the full git log and skip changes before the fromRev rather than
+   *     using a log path
+   * @param labels map where the key is the GitRevision sha and the value is the labels that should
+   *     be attached to parsed GitRevisions corresponding to that sha
+   */
+  ImmutableList<Change<GitRevision>> run(
+      @Nullable GitRevision fromRev,
+      GitRevision toRev,
+      boolean historyIsNonLinear,
+      ImmutableMap<String, ImmutableListMultimap<String, String>> labels)
+      throws RepoException, ValidationException {
+    String fromHash = fromRev == null ? null : resolveRevisionHash(fromRev.getHash());
+    String toHash = resolveRevisionHash(toRev.getHash());
+    String refExpression =
+        fromHash == null || historyIsNonLinear
+          ? toHash
+          : fromHash + ".." + toHash;
+    LogCmd logCmd = repository.log(refExpression).firstParent(firstParent).topoOrder(topoOrder);
+    if (limit != -1) {
+      logCmd = logCmd.withLimit(limit);
+    }
+    if (skip > 0) {
+      logCmd = logCmd.withSkip(skip);
+    }
+    if (batchSize > 0) {
+      logCmd = logCmd.withBatchSize(batchSize);
+    }
+    if (grepString != null) {
+      logCmd = logCmd.grep(grepString);
+    }
+    if (partialFetch && roots.contains("")) {
+      throw new ValidationException(
+          "Config error: partial_fetch feature is not compatible "
+              + "with fetching the whole repo.");
+    }
+    if (partialFetch) {
+      logCmd = logCmd.withPaths(roots);
+    }
+
+    // Log command does not filter by roots here because of how git log works. Some commits (e.g.
+    // fake merges) might not include the files in the log, and filtering here would return
+    // incorrect results. We do filter later on the changes to match the actual glob.
+    return parseChanges(logCmd.includeFiles(true).includeMergeDiff(true).run(), labels, toRev);
+  }
+
+  static final String BRANCH_COMMIT_LOG_HEADING = "-- Branch commit log --";
+
+  private CharSequence branchCommitLog(GitRevision ref, List<GitRevision> parents)
+      throws RepoException {
+    if (parents.size() <= 1) {
+      // Not a merge commit, so don't bother showing full log of branch commits. This would only
+      // contain the raw commit of 'ref', which will be redundant.
+      return "";
+    }
+    if (!includeBranchCommitLogs) {
+      return "";
+    }
+
+    ImmutableList<GitLogEntry> entries =
+        repository
+            .log(parents.get(0).getHash() + ".." + ref.getHash())
+            // This might give incorrect results but several migrations rely on this behavior.
+            // and first_parent = False doesn't work for ITERATIVE
+            .withPaths(Glob.isEmptyRoot(roots) ? ImmutableList.of() : roots)
+            .firstParent(false)
+            .run();
+
+    if (entries.isEmpty()) {
+      return "";
+    }
+    // Remove the merge commit. Since we already have that in the body.
+    entries = entries.subList(1, entries.size());
+
+    StringBuilder sb = new StringBuilder("\n").append(BRANCH_COMMIT_LOG_HEADING).append("\n");
+    boolean first = true;
+    for (GitLogEntry e : entries) {
+      if (!first) {
+        sb.append("\n");
+      }
+      sb.append("commit ")
+          .append(e.commit().getHash())
+          .append("\n")
+          .append("Author:  ")
+          .append(filterAuthor(e.author()))
+          .append("\n")
+          .append("Date:    ")
+          .append(e.authorDate())
+          .append("\n")
+          .append("\n")
+          .append("    ")
+          .append(e.body().replace("\n", "    \n"));
+      first = false;
+    }
+    return sb.toString();
+  }
+
+  private ImmutableList<Change<GitRevision>> parseChanges(
+      ImmutableList<GitLogEntry> logEntries,
+      ImmutableMap<String, ImmutableListMultimap<String, String>> labels,
+      GitRevision toRev)
+      throws RepoException {
+    ImmutableMap<String, ImmutableListMultimap<String, String>> resolvedLabels =
+        labels.entrySet().stream()
+            .collect(toImmutableMap(e -> resolveRevisionHash(e.getKey()), e -> e.getValue()));
+
+    String toHash = resolveRevisionHash(toRev.getHash());
+
+    ImmutableList.Builder<Change<GitRevision>> result = ImmutableList.builder();
+    GitRevision last = null;
+    for (GitLogEntry e : logEntries) {
+      // Keep the first commit if repeated (merge commits).
+      if (last != null && last.equals(e.commit())) {
+        continue;
+      }
+      last = e.commit();
+      ImmutableListMultimap<String, String> labelsToCopy =
+          resolvedLabels.getOrDefault(e.commit().getHash(), ImmutableListMultimap.of());
+      // Carry over the context reference to the corresponding change in the list.
+      if ((last.getHash().equals(toHash) || last.getHash().equals(toRev.getHash()))
+          && toRev.contextReference() != null) {
+        last = last.withContextReference(toRev.contextReference());
+      }
+      result.add(
+          new Change<>(
+              last.withUrl(url).withLabels(labelsToCopy),
+              filterAuthor(e.author()),
+              e.body() + branchCommitLog(last, e.parents()),
+              e.authorDate(),
+              ChangeMessage.parseAllAsLabels(e.body()).labelsAsMultimap(),
+              e.files(),
+              e.parents().size() > 1,
+              e.parents()));
+    }
+    return result.build().reverse();
+  }
+
+  private Author filterAuthor(Author author) throws RepoException {
+    try {
+      return authoring == null || authoring.useAuthor(author.getEmail())
+          ? author
+          : authoring.getDefaultAuthor();
+    } catch (EvalException e) {
+      throw new RepoException(String.format("Error checking authoring for author: %s", author), e);
+    }
+  }
+
+  private String resolveRevisionHash(String hash) {
+    return lastRevisionMap.getOrDefault(hash, hash);
+  }
+
+  /**
+   * Builder for ChangeReader.
+   */
+  static class Builder {
+
+    private Authoring authoring = null;
+    private final GitRepository repository;
+    private int limit = -1;
+    private ImmutableList<String> roots = ImmutableList.of("");
+    private boolean includeBranchCommitLogs = false;
+    private String url;
+    private boolean firstParent;
+    private boolean topoOrder;
+    private boolean partialFetch;
+    private int skip;
+    private int batchSize;
+    private String grepString;
+    private ImmutableMap<String, String> lastRevisionMap = ImmutableMap.of();
+
+    // TODO(matvore): Consider adding destinationFiles.
+    // For ALL_FILES and where roots is [""], This will skip merges that don't affect the tree
+    // For other cases, this will skip merges and commits that don't affect a subtree
+    static Builder forDestination(GitRepository repository, Console console) {
+      return new Builder(repository, console);
+    }
+
+    static Builder forOrigin(Authoring authoring, GitRepository repository, Console console) {
+      return new Builder(repository, console)
+          .setAuthoring(authoring);
+    }
+
+    private Builder(GitRepository repository, Console console) {
+      this.repository = checkNotNull(repository, "repository");
+      checkNotNull(console, "console");
+    }
+
+    Builder setLimit(int limit) {
+      Preconditions.checkArgument(limit > 0);
+      this.limit = limit;
+      return this;
+    }
+
+    Builder setSkip(int skip) {
+      Preconditions.checkArgument(skip >= 0);
+      this.skip = skip;
+      return this;
+    }
+
+    Builder setBatchSize(int batchSize) {
+      Preconditions.checkArgument(batchSize >= 0);
+      this.batchSize = batchSize;
+      return this;
+    }
+
+    private Builder setAuthoring(Authoring authoring) {
+      this.authoring = checkNotNull(authoring, "authoring");
+      return this;
+    }
+
+    Builder setPartialFetch(boolean partialFetch) {
+      this.partialFetch = partialFetch;
+      return this;
+    }
+
+    Builder setFirstParent(boolean firstParent) {
+      this.firstParent = firstParent;
+      return this;
+    }
+
+    @CanIgnoreReturnValue
+    Builder setTopoOrder(boolean topoOrder) {
+      this.topoOrder = topoOrder;
+      return this;
+    }
+
+    Builder setIncludeBranchCommitLogs(boolean includeBranchCommitLogs) {
+      this.includeBranchCommitLogs = includeBranchCommitLogs;
+      return this;
+    }
+
+    Builder setUrl(String url) {
+      this.url = url;
+      return this;
+    }
+
+    /**
+     * Only return commits that match the given paths in the Git log command.
+     */
+    Builder setRoots(Iterable<String> roots) {
+      this.roots = ImmutableList.copyOf(roots);
+      return this;
+    }
+
+    /**
+     * Grep for the given pattern in the Git log command.
+     */
+    Builder grep(String grepString) {
+      this.grepString = grepString;
+      return this;
+    }
+
+    @CanIgnoreReturnValue
+    Builder setLastRevisionMap(ImmutableMap<String, String> lastRevisionMap) {
+      this.lastRevisionMap = checkNotNull(lastRevisionMap);
+      return this;
+    }
+
+    ChangeReader build() {
+      return new ChangeReader(
+          authoring,
+          repository,
+          limit,
+          roots,
+          includeBranchCommitLogs,
+          url,
+          firstParent,
+          partialFetch,
+          topoOrder,
+          skip,
+          batchSize,
+          grepString,
+          lastRevisionMap);
+    }
+  }
+
+}

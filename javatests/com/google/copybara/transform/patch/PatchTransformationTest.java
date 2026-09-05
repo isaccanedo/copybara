@@ -1,0 +1,449 @@
+/*
+ * Copyright (C) 2016 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.copybara.transform.patch;
+
+import static com.google.common.truth.Truth.assertThat;
+import static com.google.copybara.testing.FileSubjects.assertThatPath;
+import static java.nio.charset.StandardCharsets.UTF_8;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.copybara.config.ConfigFile;
+import com.google.copybara.config.MapConfigFile;
+import com.google.copybara.git.GitRepository;
+import com.google.copybara.testing.OptionsBuilder;
+import com.google.copybara.testing.SkylarkTestExecutor;
+import com.google.copybara.testing.TransformWorks;
+import com.google.copybara.testing.git.GitTestUtil;
+import com.google.copybara.util.console.Message.MessageType;
+import com.google.copybara.util.console.testing.TestingConsole;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import net.starlark.java.syntax.Location;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.JUnit4;
+
+/**
+ * Tests for {@link PatchTransformation} and {@link PatchModule}.
+ */
+@RunWith(JUnit4.class)
+public class PatchTransformationTest {
+
+  private static final String DIFF =
+      """
+      diff --git a/test.txt b/test.txt
+      index 257cc56..5716ca5 100644
+      --- a/test.txt
+      +++ b/test.txt
+      @@ -1 +1 @@
+      -foo
+      +bar
+      diff --git a/excluded/file2.txt b/excluded/file2.txt
+      index ba0e162..9c08216 100644
+      --- a/excluded/file2.txt
+      +++ b/excluded/file2.txt
+      @@ -1 +1 @@
+      -bar
+      \\ No newline at end of file
+      +new bar
+      \\ No newline at end of file\
+      """;
+  private static final ImmutableList<String> EXCLUDED_FROM_PATCH = ImmutableList.of("excluded/*");
+
+  private OptionsBuilder options;
+  private PatchingOptions patchingOptions;
+  private Path checkoutDir;
+  private TestingConsole console;
+  private SkylarkTestExecutor skylark;
+  private ConfigFile patchFile;
+  private ConfigFile seriesFile;
+
+  @Before
+  public void setup() throws IOException {
+    checkoutDir =  Files.createTempDirectory("workdir");
+    Files.createDirectories(checkoutDir);
+    console = new TestingConsole();
+    options = new OptionsBuilder().setConsole(console);
+    patchingOptions = options.build().get(PatchingOptions.class);
+    skylark = new SkylarkTestExecutor(options);
+    ImmutableMap<String, byte[]> configFiles =
+        ImmutableMap.of(
+            "diff.patch", (DIFF).getBytes(UTF_8),
+            "series", ("diff.patch\n").getBytes(UTF_8));
+    patchFile = new MapConfigFile(configFiles , "diff.patch");
+    seriesFile = new MapConfigFile(configFiles, "series");
+    options.setEnvironment(GitTestUtil.getGitEnv().getEnvironment());
+    // In preparation to switch to the new default. PatchingOptionsTest has more coverage on this.
+    options.patch.useGitApply = false;
+    options.patch.skipVersionCheck = false;
+  }
+
+  @Test
+  public void applyTransformationTest() throws Exception {
+    Files.write(checkoutDir.resolve("test.txt"), "foo\n".getBytes(UTF_8));
+    PatchTransformation transform =
+        new PatchTransformation(
+            ImmutableList.of(patchFile),
+            EXCLUDED_FROM_PATCH,
+            patchingOptions,
+            /* reverse= */ false,
+            /* strip= */ 1,
+            /* directory= */ "",
+            Location.BUILTIN);
+
+    transform.transform(TransformWorks.of(checkoutDir, "testmsg", console));
+
+    assertThatPath(checkoutDir)
+        .containsFile("test.txt", "bar\n")
+        .containsNoMoreFiles();
+  }
+
+  @Test
+  public void skipSkippedPatchTest() throws Exception {
+    Files.write(checkoutDir.resolve("test.txt"), "foo\n".getBytes(UTF_8));
+    patchingOptions.skippedPatchFiles = ImmutableList.of(patchFile.getIdentifier());
+    PatchTransformation transform =
+        new PatchTransformation(
+            ImmutableList.of(patchFile),
+            EXCLUDED_FROM_PATCH,
+            patchingOptions,
+            /* reverse= */ false,
+            /* strip= */ 1,
+            /* directory= */ "",
+            Location.BUILTIN);
+
+    transform.transform(TransformWorks.of(checkoutDir, "testmsg", console));
+
+    // verify that the patch was NOT applied (content of test.txt remains "foo")
+    assertThatPath(checkoutDir).containsFile("test.txt", "foo\n").containsNoMoreFiles();
+    console.assertThat().matchesNextSkipAhead(MessageType.INFO, "Skipping patch diff.patch.");
+  }
+
+  @Test
+  public void insideGitFolderTest() throws Exception {
+    GitRepository.newRepo(/*verbose*/ false, checkoutDir, GitTestUtil.getGitEnv()).init();
+    Path foo = Files.createDirectories(checkoutDir.resolve("foo"));
+    Files.write(foo.resolve("test.txt"), "foo\n".getBytes(UTF_8));
+    PatchTransformation transform =
+        new PatchTransformation(
+            ImmutableList.of(patchFile),
+            EXCLUDED_FROM_PATCH,
+            patchingOptions,
+            /* reverse= */ false,
+            /* strip= */ 1,
+            /* directory= */ "",
+            Location.BUILTIN);
+
+    transform.transform(TransformWorks.of(foo, "testmsg", console));
+
+    assertThatPath(foo)
+            .containsFile("test.txt", "bar\n")
+            .containsNoMoreFiles();
+  }
+
+  @Test
+  public void reverseTransformationTest() throws Exception {
+    Files.write(checkoutDir.resolve("test.txt"), "bar\n".getBytes(UTF_8));
+    PatchTransformation transform =
+        new PatchTransformation(
+            ImmutableList.of(patchFile),
+            EXCLUDED_FROM_PATCH,
+            patchingOptions,
+            /* reverse= */ true,
+            /* strip= */ 1,
+            /* directory= */ "",
+            Location.BUILTIN);
+
+    transform.transform(TransformWorks.of(checkoutDir, "testmsg", console));
+
+    assertThatPath(checkoutDir)
+        .containsFile("test.txt", "foo\n")
+        .containsNoMoreFiles();
+  }
+
+  @Test
+  public void testParseSkylark() throws Exception {
+    Files.write(checkoutDir.resolve("test.txt"), "foo\n".getBytes(UTF_8));
+    skylark.addConfigFile("diff.patch", patchFile.readContent());
+    PatchTransformation transformation =
+        skylark.eval(
+            "r",
+            """
+            r = patch.apply(
+              patches = ['diff.patch'],
+              excluded_patch_paths = ['excluded/*'],
+            )
+            """);
+
+    transformation.transform(TransformWorks.of(checkoutDir, "testmsg", console));
+
+    assertThatPath(checkoutDir)
+        .containsFile("test.txt", "bar\n")
+        .containsNoMoreFiles();
+  }
+
+  @Test
+  public void testPathStrip() throws Exception {
+    patchingOptions.skipVersionCheck = true;
+    Files.write(checkoutDir.resolve("test.txt"), "foo\n".getBytes(UTF_8));
+    skylark.addConfigFile(
+        "diff.patch",
+        """
+        diff --git test.txt test.txt
+        index 257cc56..5716ca5 100644
+        --- test.txt
+        +++ test.txt
+        @@ -1 +1 @@
+        -foo
+        +bar
+        """);
+    PatchTransformation transformation =
+        skylark.eval(
+            "r",
+            """
+            r = patch.apply(
+              patches = ['diff.patch'],
+              strip = 0,
+            )
+            """);
+
+    transformation.transform(TransformWorks.of(checkoutDir, "testmsg", console));
+
+    assertThatPath(checkoutDir)
+        .containsFile("test.txt", "bar\n")
+        .containsNoMoreFiles();
+  }
+
+  @Test
+  public void testPathDirectory() throws Exception {
+    patchingOptions.skipVersionCheck = true;
+    Path subdir = Files.createDirectories(checkoutDir.resolve("sub/dir"));
+    Files.write(subdir.resolve("test.txt"), "foo\n".getBytes(UTF_8));
+    skylark.addConfigFile(
+        "diff.patch",
+        """
+        diff --git dir/test.txt dir/test.txt
+        index 257cc56..5716ca5 100644
+        --- dir/test.txt
+        +++ dir/test.txt
+        @@ -1 +1 @@
+        -foo
+        +bar
+        """);
+    PatchTransformation transformation =
+        skylark.eval(
+            "r",
+            """
+            r = patch.apply(
+              patches = ['diff.patch'],
+              strip = 0,
+              directory = 'sub/',
+            )
+            """);
+
+    transformation.transform(TransformWorks.of(checkoutDir, "testmsg", console));
+
+    assertThatPath(checkoutDir).containsFile("sub/dir/test.txt", "bar\n").containsNoMoreFiles();
+  }
+
+  @Test
+  public void testParseSkylarkSeries() throws Exception {
+    Files.write(checkoutDir.resolve("test.txt"), "foo\n".getBytes(UTF_8));
+    skylark.addConfigFile("diff.patch", patchFile.readContent());
+    skylark.addConfigFile("series", seriesFile.readContent());
+    PatchTransformation transformation =
+        skylark.eval(
+            "r",
+            """
+            r = patch.apply(
+              series = 'series',
+              excluded_patch_paths = ['excluded/*'],
+            )
+            """);
+
+    transformation.transform(TransformWorks.of(checkoutDir, "testmsg", console));
+
+    assertThatPath(checkoutDir)
+        .containsFile("test.txt", "bar\n")
+        .containsNoMoreFiles();
+  }
+
+  @Test
+  public void testParseSkylarkSeriesRelaxedCheck() throws Exception {
+    patchingOptions.validateOnLoad = false;
+    Files.write(checkoutDir.resolve("test.txt"), "foo\n".getBytes(UTF_8));
+    skylark.addConfigFile("series", seriesFile.readContent());
+
+    PatchTransformation transformation =
+        skylark.eval(
+            "r",
+            """
+            r = patch.apply(
+              series = 'series',
+              excluded_patch_paths = ['excluded/*'],
+            )
+            """);
+
+    assertThat(transformation).isNotNull();
+  }
+
+  @Test
+  public void testParseSkylarkRelaxedCheck() throws Exception {
+    patchingOptions.validateOnLoad = false;
+    Files.write(checkoutDir.resolve("test.txt"), "foo\n".getBytes(UTF_8));
+
+    PatchTransformation transformation =
+        skylark.eval(
+            "r",
+            """
+            r = patch.apply(
+              patches = ['diff.patch'],
+              excluded_patch_paths = ['excluded/*'],
+            )
+            """);
+
+    console.assertThat().onceInLog(MessageType.VERBOSE, "Cannot load.*");
+    console.assertThat().timesInLog(0, MessageType.INFO, "Cannot load.*");
+    assertThat(transformation).isNotNull();
+  }
+
+  @Test
+  public void testValidationLevelFull_emptySeriesThrows() throws Exception {
+    skylark.addConfigFile("series", "");
+
+    skylark.evalFails(
+        """
+        patch.apply(
+          series = 'series',
+          excluded_patch_paths = ['excluded/*'],
+          validation_level = 'FULL',
+        )
+        """,
+        ".*series cannot be empty.*");
+  }
+
+  @Test
+  public void testValidationLevelFull_missingSeriesThrows() throws Exception {
+    skylark.evalFails(
+        """
+        patch.apply(
+          series = 'missing_series',
+          validation_level = 'FULL',
+        )
+        """,
+        "Cannot resolve.*");
+  }
+
+  @Test
+  public void testValidationLevelDefaultIsOptionalSeries_missingSeriesLoads() throws Exception {
+    PatchTransformation transformation =
+        skylark.eval(
+            "r",
+            """
+            r = patch.apply(
+              series = 'missing_series',
+            )
+            """);
+
+    console.assertThat().timesInLog(0, MessageType.INFO, "Cannot load.*");
+    console.assertThat().onceInLog(MessageType.VERBOSE, "Cannot load missing_series.*");
+    assertThat(transformation.describe()).isEqualTo("Patch.apply: ");
+  }
+
+  @Test
+  public void testValidationLevelOptionalSeries_missingSeriesLoads() throws Exception {
+    PatchTransformation transformation =
+        skylark.eval(
+            "r",
+            """
+            r = patch.apply(
+              series = 'missing_series',
+              validation_level = 'OPTIONAL_SERIES',
+            )
+            """);
+
+    console.assertThat().timesInLog(0, MessageType.INFO, "Cannot load.*");
+    console.assertThat().onceInLog(MessageType.VERBOSE, "Cannot load missing_series.*");
+    assertThat(transformation.describe()).isEqualTo("Patch.apply: ");
+  }
+
+  @Test
+  public void testValidationLevelOptionalSeries_missingPatchThrows() throws Exception {
+    skylark.evalFails(
+        """
+        patch.apply(
+          patches = ['missing.patch'],
+          validation_level = 'OPTIONAL_SERIES',
+        )
+        """,
+        "Failed to resolve patch: missing.patch");
+  }
+
+  @Test
+  public void testValidationLevelNone_missingPatchLogs() throws Exception {
+    PatchTransformation transformation =
+        skylark.eval(
+            "r",
+            """
+            r = patch.apply(
+              patches = ['missing.patch'],
+              validation_level = 'NONE',
+            )
+            """);
+
+    console.assertThat().onceInLog(MessageType.VERBOSE, "Cannot load: missing.patch");
+    console.assertThat().timesInLog(0, MessageType.INFO, "Cannot load.*");
+    assertThat(transformation).isNotNull();
+  }
+
+  @Test
+  public void testValidateOnLoadOverride() throws Exception {
+    patchingOptions.validateOnLoad = false;
+
+    PatchTransformation transformation =
+        skylark.eval(
+            "r",
+            """
+            r = patch.apply(
+              patches = ['missing.patch'],
+              validation_level = 'FULL',
+            )
+            """);
+
+    console.assertThat().onceInLog(MessageType.VERBOSE, "Cannot load: missing.patch");
+    console.assertThat().timesInLog(0, MessageType.INFO, "Cannot load.*");
+    assertThat(transformation).isNotNull();
+  }
+
+  @Test
+  public void testDescribe() {
+    PatchTransformation transform =
+        new PatchTransformation(
+            ImmutableList.of(patchFile, patchFile),
+            EXCLUDED_FROM_PATCH,
+            patchingOptions,
+            /* reverse= */ false,
+            /* strip= */ 1,
+            /* directory= */ "",
+            Location.BUILTIN);
+
+    assertThat(transform.describe()).isEqualTo("Patch.apply: diff.patch, diff.patch");
+  }
+}

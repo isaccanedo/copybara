@@ -1,0 +1,1053 @@
+/*
+ * Copyright (C) 2016 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.copybara.git;
+
+import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.Truth.assertWithMessage;
+import static com.google.copybara.git.GitIntegrateChanges.Strategy.FAKE_MERGE;
+import static com.google.copybara.git.GitIntegrateChanges.Strategy.FAKE_MERGE_AND_INCLUDE_FILES;
+import static com.google.copybara.git.GitIntegrateChanges.Strategy.INCLUDE_FILES;
+import static com.google.copybara.testing.git.GitTestUtil.getGitEnv;
+import static com.google.copybara.util.CommandRunner.DEFAULT_TIMEOUT;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.Assert.assertThrows;
+
+import com.google.common.base.Ascii;
+import com.google.common.base.Joiner;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
+import com.google.copybara.Destination.DestinationStatus;
+import com.google.copybara.Destination.Writer;
+import com.google.copybara.TransformResult;
+import com.google.copybara.WriterContext;
+import com.google.copybara.exception.CannotResolveRevisionException;
+import com.google.copybara.exception.RepoException;
+import com.google.copybara.exception.ValidationException;
+import com.google.copybara.git.GitIntegrateChanges.Strategy;
+import com.google.copybara.git.GitRepository.GitLogEntry;
+import com.google.copybara.git.GitRevision.GitHashAlgorithm;
+import com.google.copybara.git.testing.GitTesting;
+import com.google.copybara.testing.DummyOrigin;
+import com.google.copybara.testing.DummyRevision;
+import com.google.copybara.testing.OptionsBuilder;
+import com.google.copybara.testing.SkylarkTestExecutor;
+import com.google.copybara.testing.TransformResults;
+import com.google.copybara.testing.git.GitTestUtil;
+import com.google.copybara.util.Glob;
+import com.google.copybara.util.console.Message.MessageType;
+import com.google.copybara.util.console.testing.TestingConsole;
+import com.google.testing.junit.testparameterinjector.TestParameter;
+import com.google.testing.junit.testparameterinjector.TestParameterInjector;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Collection;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+
+@RunWith(TestParameterInjector.class)
+public class GitDestinationIntegrateTest {
+
+  @TestParameter private GitHashAlgorithm repoFormat;
+
+  private static final String CHANGE_ID = "Id5287e977c0d840a6d84eb2c3c1841036c411890";
+
+  private String url;
+
+  private Path repoGitDir;
+  private OptionsBuilder options;
+  private TestingConsole console;
+  private Glob destinationFiles;
+  private SkylarkTestExecutor skylark;
+
+  private Path workdir;
+  private GitTestUtil gitUtil;
+  private String primaryBranch;
+
+  @Before
+  public void setup() throws Exception {
+    repoGitDir = Files.createTempDirectory("GitDestinationTest-repoGitDir");
+    workdir = Files.createTempDirectory("workdir");
+
+    git(
+        "init",
+        "--bare",
+        "--object-format=" + Ascii.toLowerCase(repoFormat.name()),
+        repoGitDir.toString());
+
+    console = new TestingConsole();
+    options = new OptionsBuilder()
+        .setConsole(console)
+        .setOutputRootToTmpDir();
+
+    gitUtil = new GitTestUtil(options);
+    gitUtil.mockRemoteGitRepos();
+
+    options.gitDestination = new GitDestinationOptions(options.general, options.git);
+    options.gitDestination.committerEmail = "commiter@email";
+    options.gitDestination.committerName = "Bara Kopi";
+
+    destinationFiles = Glob.createGlob(ImmutableList.of("**"), ImmutableList.of("ignore*"));
+    options.setForce(true);
+
+    url = "file://" + repoGitDir;
+    skylark = new SkylarkTestExecutor(options);
+    primaryBranch = repo().getPrimaryBranch();
+  }
+
+  @Test
+  public void testNoIntegration() throws ValidationException, IOException, RepoException {
+    migrateOriginChange(
+        destination(
+            "url = '" + url + "'",
+            String.format("fetch = '%s'", primaryBranch),
+            String.format("push = '%s'", primaryBranch),
+            "integrates = []"),
+        String.format(
+            """
+            Test change
+
+            %s=http://should_not_be_used
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL),
+        "some content");
+
+    // Make sure commit adds new text
+    String showResult = git("--git-dir", repoGitDir.toString(), "show", primaryBranch);
+    assertThat(showResult).contains("some content");
+
+    GitTesting.assertThatCheckout(repo(), primaryBranch)
+        .containsFile("test.txt", "some content")
+        .containsNoMoreFiles();
+  }
+
+  @Test
+  public void testIntegrateForUnrelatedBranchesFail()
+      throws ValidationException, IOException, RepoException {
+    Path repoPath = Files.createTempDirectory("test");
+    GitRepository repo =
+        GitRepository.newRepo(/*verbose*/ true, repoPath, getGitEnv()).init(repoFormat);
+    GitRevision feature1 = singleChange(repoPath, repo, "ignore_me", "Feature1 change");
+    repo.branch("feature1").run();
+
+    GitDestination destination = destinationWithDefaultIntegrates();
+    migrateOriginChange(destination, "Base change\n", "not important");
+    GitLogEntry previous = getLastMigratedChange(primaryBranch);
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=file://%s feature1
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL, repo.getWorkTree()),
+        "some content");
+
+    GitLogEntry commit = Iterables.getOnlyElement(
+        repo().log(primaryBranch).withLimit(1).run());
+    // Make sure merge with unrelated repo didn't happen and that the parent is the previous
+    // change for the this repo.
+    assertThat(commit.parents()).containsExactly(previous.commit());
+  }
+
+  @Test
+  public void testDefaultIntegration() throws ValidationException, IOException, RepoException {
+    Path repoPath = Files.createTempDirectory("test");
+
+    // Create a common baseline between the two repos
+    GitDestination destination = destinationWithDefaultIntegrates();
+    migrateOriginChange(destination, "Base change\n", "not important");
+
+    GitRepository repo =
+        GitRepository.newRepo(/*verbose*/ true, repoPath, getGitEnv()).init(repoFormat);
+    repo.simpleCommand("pull", "file://" + repoGitDir);
+
+    GitRevision feature1 = singleChange(repoPath, repo, "ignore_me", "Feature1 change");
+    repo.branch("feature1").run();
+    GitRevision feature2 = singleChange(repoPath, repo, "ignore_me2", "Feature2 change");
+    repo.branch("feature2").run();
+
+    migrateOriginChange(destination, "Base change 2\n", "not important 2");
+    GitLogEntry previous = getLastMigratedChange(primaryBranch);
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %1$s=file://%2$s feature1
+            %1$s=file://%2$s feature2
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL, repo.getWorkTree()),
+        "some content");
+
+    // Make sure commit adds new text
+    String showResult = git("--git-dir", repoGitDir.toString(), "show", primaryBranch + "^1");
+    assertThat(showResult).contains("some content");
+
+    GitTesting.assertThatCheckout(repo(), primaryBranch)
+        .containsFile("test.txt", "some content")
+        .containsFile("ignore_me", "")
+        .containsFile("ignore_me2", "")
+        .containsNoMoreFiles();
+
+    GitLogEntry feature1Merge = getLastMigratedChange(primaryBranch + "^1");
+
+    assertThat(feature1Merge.files()).containsExactly("test.txt", "ignore_me");
+
+    assertThat(feature1Merge.body())
+        .isEqualTo(
+            "Merge of " + feature1.getHash() + "\n" + "\n" + DummyOrigin.LABEL_NAME + ": test\n");
+
+    assertThat(Lists.transform(feature1Merge.parents(), GitRevision::getHash))
+        .isEqualTo(Lists.newArrayList(previous.commit().getHash(), feature1.getHash()));
+
+    GitLogEntry feature2Merge = getLastMigratedChange(primaryBranch);
+    assertThat(feature2Merge.body())
+        .isEqualTo(
+            "Merge of " + feature2.getHash() + "\n" + "\n" + DummyOrigin.LABEL_NAME + ": test\n");
+
+    assertThat(Lists.transform(feature2Merge.parents(), GitRevision::getHash))
+        .isEqualTo(Lists.newArrayList(feature1Merge.commit().getHash(), feature2.getHash()));
+  }
+
+  /**
+   * Checks that we can correctly read destination status (last fake merge commit created) after
+   * an integration.
+   *
+   * <p>Don't change the file paths or contents of this test. It needs to be like this to generate
+   * an empty diff with the feature branch (pure fake-merge).
+   */
+  @Test
+  public void testDestinationStatus() throws ValidationException, IOException, RepoException {
+    destinationFiles = Glob.createGlob(ImmutableList.of("foo/**"));
+    Path gitDir = Files.createTempDirectory("gitdir");
+    Path repoPath = Files.createTempDirectory("workdir");
+    GitRepository repo =
+        GitRepository.newBareRepo(
+                gitDir, getGitEnv(), /* verbose= */ true, DEFAULT_TIMEOUT, /* noVerify= */ false)
+            .init(repoFormat)
+            .withWorkTree(repoPath);
+
+    singleChange(repoPath, repo, "base.txt", "first change");
+    repo.branch("feature1").run();
+    repo.forceCheckout("feature1");
+    GitRevision feature = singleChange(repoPath, repo, "foo/a", "Feature 1 change");
+    repo.forceCheckout(primaryBranch);
+
+    // Just so that the migration doesn't fail since the git repo is a non-bare repo.
+    repo.forceCheckout("feature1");
+
+    GitDestination destination = destination("url = 'file://" + repo.getGitDir() + "'",
+        String.format("push='%s'", primaryBranch));
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=file://%s feature1
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL, repo.getGitDir()),
+        "foo/a",
+        "",
+        "the_rev");
+
+    GitLogEntry featureMerge = getLastMigratedChange(primaryBranch, repo);
+
+    assertThat(featureMerge.body())
+        .isEqualTo(
+            "Merge of " + feature.getHash() + "\n" + "\n" + DummyOrigin.LABEL_NAME + ": the_rev\n");
+    WriterContext writerContext =
+        new WriterContext("piper_to_github", "TEST", false, new DummyRevision("feature"),
+            Glob.ALL_FILES.roots());
+    DestinationStatus destinationStatus = destination.newWriter(writerContext)
+        .getDestinationStatus(destinationFiles, DummyOrigin.LABEL_NAME);
+    assertWithMessage(gitDir.toString()).that(destinationStatus.getBaseline()).isEqualTo("the_rev");
+  }
+
+  @Test
+  public void testFakeMerge() throws ValidationException, IOException, RepoException {
+    Path repoPath = Files.createTempDirectory("test");
+    GitDestination destination = destination(FAKE_MERGE);
+    migrateOriginChange(destination, "Base change\n", "not important");
+
+    GitRepository repo =
+        GitRepository.newRepo(/*verbose*/ true, repoPath, getGitEnv()).init(repoFormat);
+    repo.simpleCommand("pull", "file://" + repoGitDir);
+
+    GitRevision feature1 = singleChange(repoPath, repo, "ignore_me", "Feature1 change");
+    repo.branch("feature1").run();
+    GitRevision feature2 = singleChange(repoPath, repo, "ignore_me2", "Feature2 change");
+    repo.branch("feature2").run();
+
+    migrateOriginChange(destination, "Base change\n", "not important 2");
+    GitLogEntry previous = getLastMigratedChange(primaryBranch);
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=file://%s feature1
+            %s=file://%s feature2
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL,
+            repo.getWorkTree(),
+            GitModule.DEFAULT_INTEGRATE_LABEL,
+            repo.getWorkTree()),
+        "some content");
+
+    // Make sure commit adds new text
+    String showResult = git("--git-dir", repoGitDir.toString(), "show", primaryBranch + "^1");
+    assertThat(showResult).contains("some content");
+
+    GitTesting.assertThatCheckout(repo(), primaryBranch)
+        .containsFile("test.txt", "some content")
+        .containsNoMoreFiles();
+
+    GitLogEntry feature1Merge = getLastMigratedChange(primaryBranch + "^1");
+    assertThat(feature1Merge.body())
+        .isEqualTo(
+            "Merge of " + feature1.getHash() + "\n" + "\n" + DummyOrigin.LABEL_NAME + ": test\n");
+
+    assertThat(Lists.transform(feature1Merge.parents(), GitRevision::getHash))
+        .isEqualTo(Lists.newArrayList(previous.commit().getHash(), feature1.getHash()));
+
+    GitLogEntry feature2Merge = getLastMigratedChange(primaryBranch);
+    assertThat(feature2Merge.body())
+        .isEqualTo(
+            "Merge of " + feature2.getHash() + "\n" + "\n" + DummyOrigin.LABEL_NAME + ": test\n");
+
+    assertThat(feature1Merge.files()).containsExactly("test.txt");
+
+    assertThat(Lists.transform(feature2Merge.parents(), GitRevision::getHash))
+        .isEqualTo(Lists.newArrayList(feature1Merge.commit().getHash(), feature2.getHash()));
+  }
+
+  private GitDestination destination(Strategy strategy) throws ValidationException {
+    return destination(strategy, /* allowUnrelatedHistory= */ false);
+  }
+
+  private GitDestination destination(Strategy strategy, boolean allowUnrelatedHistory)
+      throws ValidationException {
+    return destination(
+        "url = '" + url + "'",
+        String.format("push='%s'", primaryBranch),
+        """
+        integrates = [git.integrate(
+                 ignore_errors = False,
+                 allow_unrelated_history = %s,
+                 strategy = '%s',
+            ),]\
+        """
+            .formatted(allowUnrelatedHistory ? "True" : "False", strategy));
+  }
+
+  private GitDestination destination(String... args) throws ValidationException {
+    return skylark.eval(
+        "r",
+        String.format(
+            """
+            r = git.destination(
+                %s
+            )\
+            """,
+            Joiner.on(",\n    ").join(args)));
+  }
+
+  @Test
+  public void testFakeMerge_unrelatedHistoryNotAllowed_skipsMerge() throws Exception {
+    Path otherRepoPath = Files.createTempDirectory("otherRepo");
+    GitDestination destination = destination(FAKE_MERGE, /* allowUnrelatedHistory= */ false);
+    migrateOriginChange(destination, "Base change\n", "not important");
+
+    GitRepository otherRepo =
+        GitRepository.newRepo(/* verbose= */ true, otherRepoPath, getGitEnv()).init(repoFormat);
+    GitRevision unrelatedRevision =
+        singleChange(otherRepoPath, otherRepo, "unrelated.txt", "Unrelated commit");
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=file://%s %s
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL,
+            otherRepo.getWorkTree(),
+            otherRepo.getPrimaryBranch()),
+        "some content");
+
+    assertThat(
+            console.getMessages().stream()
+                .filter(e -> e.getType() == MessageType.WARNING)
+                .anyMatch(
+                    msg ->
+                        msg.getText().contains("Skipping creation of merge for")
+                            && msg.getText().contains("cannot find a common parent")))
+        .isTrue();
+
+    GitLogEntry latestMigrated = getLastMigratedChange(primaryBranch);
+    // Because merge creation was skipped, latestMigrated only has 1 parent (the base change)
+    assertThat(latestMigrated.parents()).hasSize(1);
+  }
+
+  @Test
+  public void testFakeMerge_unrelatedHistoryAllowed_createsMerge() throws Exception {
+    Path otherRepoPath = Files.createTempDirectory("otherRepo");
+    GitDestination destination = destination(FAKE_MERGE, /* allowUnrelatedHistory= */ true);
+    migrateOriginChange(destination, "Base change\n", "not important");
+
+    GitRepository otherRepo =
+        GitRepository.newRepo(/* verbose= */ true, otherRepoPath, getGitEnv()).init(repoFormat);
+    GitRevision unrelatedRevision =
+        singleChange(otherRepoPath, otherRepo, "unrelated.txt", "Unrelated commit");
+
+    GitLogEntry baseChange = getLastMigratedChange(primaryBranch);
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=file://%s %s
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL,
+            otherRepo.getWorkTree(),
+            otherRepo.getPrimaryBranch()),
+        "some content");
+
+    assertThat(
+            console.getMessages().stream()
+                .filter(e -> e.getType() == MessageType.WARNING)
+                .anyMatch(msg -> msg.getText().contains("Skipping creation of merge for")))
+        .isFalse();
+
+    GitLogEntry latestMigrated = getLastMigratedChange(primaryBranch);
+    assertThat(latestMigrated.body())
+        .isEqualTo(
+            "Merge of "
+                + unrelatedRevision.getHash()
+                + "\n\n"
+                + DummyOrigin.LABEL_NAME
+                + ": test\n");
+
+    assertThat(Lists.transform(latestMigrated.parents(), GitRevision::getHash))
+        .isEqualTo(Lists.newArrayList(baseChange.commit().getHash(), unrelatedRevision.getHash()));
+  }
+
+  @Test
+  public void testIncludeFiles() throws ValidationException, IOException, RepoException {
+    Path repoPath = Files.createTempDirectory("test");
+    GitRepository repo =
+        GitRepository.newRepo(/*verbose*/ true, repoPath, getGitEnv()).init(repoFormat);
+    singleChange(repoPath, repo, "ignore_me", "Feature1 change");
+    repo.branch("feature1").run();
+    singleChange(repoPath, repo, "ignore_me2", "Feature2 change");
+    repo.branch("feature2").run();
+
+    GitDestination destination = destination(INCLUDE_FILES);
+    migrateOriginChange(destination, "Base change\n", "not important");
+    GitLogEntry previous = getLastMigratedChange(primaryBranch);
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=file://%s feature1
+            %s=file://%s feature2
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL,
+            repo.getWorkTree(),
+            GitModule.DEFAULT_INTEGRATE_LABEL,
+            repo.getWorkTree()),
+        "some content");
+
+    // Make sure commit adds new text
+    String showResult = git("--git-dir", repoGitDir.toString(), "show", primaryBranch);
+    assertThat(showResult).contains("some content");
+
+    GitTesting.assertThatCheckout(repo(), primaryBranch)
+        .containsFile("test.txt", "some content")
+        .containsFile("ignore_me", "")
+        .containsFile("ignore_me2", "")
+        .containsNoMoreFiles();
+
+    GitLogEntry afterChange = getLastMigratedChange(primaryBranch);
+    assertThat(afterChange.body()).isEqualTo("Test change\n"
+        + "\n"
+        + DummyOrigin.LABEL_NAME + ": test\n");
+
+    assertThat(Lists.transform(afterChange.parents(), GitRevision::getHash))
+        .isEqualTo(Lists.newArrayList(previous.commit().getHash()));
+  }
+
+  @Test
+  public void testIncludeFilesOutdatedBranch() throws Exception {
+    Path repoPath = Files.createTempDirectory("test");
+    GitRepository repo = repo().withWorkTree(repoPath);
+    singleChange(repoPath, repo, "ignore_base.txt", "original", "base change");
+    repo.branch("feature").run();
+    singleChange(repoPath, repo, "ignore_base.txt", "modified", "more changes");
+    repo.forceCheckout("feature");
+    singleChange(repoPath, repo, "ignore_but_changed.txt", "feature", "external change");
+    singleChange(repoPath, repo, "feature_file.txt", "feature", "internal change");
+    GitRevision prHead = repo.resolveReference("HEAD");
+
+    GitDestination destination = destination(FAKE_MERGE_AND_INCLUDE_FILES);
+    migrateOriginChange(destination, "Base change\n", "test.txt", "not important", "test");
+    GitLogEntry previous = getLastMigratedChange(primaryBranch);
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=file://%s feature
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL, repo.getGitDir()),
+        "feature_file.txt",
+        "feature modified",
+        "test");
+
+    // Make sure commit adds new text
+    String showResult = git("--git-dir", repoGitDir.toString(), "show", primaryBranch);
+    assertThat(showResult).contains("Merge of ");
+
+    GitTesting.assertThatCheckout(repo, primaryBranch)
+        .containsFile("test.txt", "not important")
+        .containsFile("ignore_base.txt", "modified")
+        .containsFile("ignore_but_changed.txt", "feature")
+        .containsFile("feature_file.txt", "feature modified")
+        .containsNoMoreFiles();
+
+    GitLogEntry afterChange = getLastMigratedChange(primaryBranch);
+    assertThat(afterChange.body())
+        .isEqualTo(
+            "Merge of " + prHead.getHash() + "\n" + "\n" + DummyOrigin.LABEL_NAME + ": test\n");
+
+    assertThat(Lists.transform(afterChange.parents(), GitRevision::getHash))
+        .isEqualTo(Lists.newArrayList(previous.commit().getHash(), prHead.getHash()));
+  }
+
+  @Test
+  public void testGitHubSemiFakeMerge() throws ValidationException, IOException, RepoException {
+    Path workTree = Files.createTempDirectory("test");
+    // Create a common baseline between the two repos
+    GitDestination destination = destinationWithDefaultIntegrates();
+    migrateOriginChange(destination, "Base change\n", "not important 2");
+
+    GitRepository repo =
+        gitUtil.mockRemoteRepo("github.com/example/test_repo", repoFormat).withWorkTree(workTree);
+    repo.simpleCommand("pull", "file://" + repoGitDir);
+
+    GitRevision firstChange = singleChange(workTree, repo, "ignore_me", "Feature1 change");
+    GitRevision secondChange = singleChange(workTree, repo, "ignore_me2", "Feature2 change");
+
+    repo.simpleCommand("update-ref", "refs/pull/20/head", secondChange.getHash());
+
+    GitLogEntry previous = createBaseDestinationChange(destination);
+
+    GitHubPrIntegrateLabel labelObj =
+        new GitHubPrIntegrateLabel(
+            repo,
+            options.general,
+            "example/test_repo",
+            20,
+            "some_user:1234-foo.bar.baz%3",
+            secondChange.getHash());
+
+    assertThat(labelObj.getProjectId()).isEqualTo("example/test_repo");
+    assertThat(labelObj.getPrNumber()).isEqualTo(20L);
+    assertThat(labelObj.getOriginBranch()).isEqualTo("some_user:1234-foo.bar.baz%3");
+    assertThat(labelObj.mergeMessage(ImmutableList.of()))
+        .isEqualTo("Merge pull request #20 from some_user:1234-foo.bar.baz%3\n");
+
+    String label = labelObj.toString();
+
+    assertThat(label)
+        .isEqualTo(
+            "https://github.com/example/test_repo/pull/20"
+                + " from some_user:1234-foo.bar.baz%3 "
+                + secondChange.getHash());
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=%s
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL, label),
+        "some content");
+
+    // Make sure commit adds new text
+    String showResult = git("--git-dir", repoGitDir.toString(), "show", primaryBranch);
+    assertThat(showResult).contains("some content");
+
+    GitTesting.assertThatCheckout(repo(), primaryBranch)
+        .containsFile("test.txt", "some content")
+        .containsFile("ignore_me", "")
+        .containsFile("ignore_me2", "")
+        .containsNoMoreFiles();
+
+    GitLogEntry merge = getLastMigratedChange(primaryBranch);
+    assertThat(merge.body())
+        .isEqualTo(
+            """
+            Merge pull request #20 from some_user:1234-foo.bar.baz%3
+
+            DummyOrigin-RevId: test
+            """);
+
+    assertThat(Lists.transform(merge.parents(), GitRevision::getHash))
+        .isEqualTo(Lists.newArrayList(previous.commit().getHash(), secondChange.getHash()));
+
+    assertThat(console.getMessages().stream()
+        .filter(e -> e.getType() == MessageType.WARNING)
+        .collect(Collectors.toList())).isEmpty();
+
+    label =
+        new GitHubPrIntegrateLabel(
+                repo,
+                options.general,
+                "example/test_repo",
+                20,
+                "some_user:branch",
+                firstChange.getHash())
+            .toString();
+    assertThat(label)
+        .isEqualTo(
+            "https://github.com/example/test_repo/pull/20"
+                + " from some_user:branch "
+                + firstChange.getHash());
+
+    repo().withWorkTree(workTree).simpleCommand("reset", "--hard", "HEAD~1");
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=%s
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL, label),
+        "some content");
+
+    assertThat(
+            console.getMessages().stream()
+                .filter(e -> e.getType() == MessageType.WARNING)
+                .findAny()
+                .get()
+                .getText())
+        .contains("has more changes after " + firstChange.getHash());
+  }
+
+  @Test
+  public void testGerritSemiFakeMerge() throws ValidationException, IOException, RepoException {
+    Path workTree = Files.createTempDirectory("test");
+
+    GitDestination destination = destinationWithDefaultIntegrates();
+    migrateOriginChange(destination, "Base change\n", "not important 2");
+
+    GitRepository repo =
+        gitUtil.mockRemoteRepo("example.com/gerrit", repoFormat).withWorkTree(workTree);
+
+    repo.simpleCommand("pull", "file://" + repoGitDir);
+
+    String label = new GerritIntegrateLabel(repo, options.general, "https://example.com/gerrit",
+        1020, 1, CHANGE_ID).toString();
+
+    assertThat(label).isEqualTo("gerrit https://example.com/gerrit 1020 Patch Set 1 " + CHANGE_ID);
+
+    GitRevision firstChange = singleChange(workTree, repo, "ignore_me", "Feature1 change");
+    GitRevision secondChange = singleChange(workTree, repo, "ignore_me2", "Feature2 change");
+
+    GitTestUtil.createFakeGerritNodeDbMeta(repo, 1020, CHANGE_ID);
+    repo.simpleCommand("update-ref", "refs/changes/20/1020/1", firstChange.getHash());
+    repo.simpleCommand("update-ref", "refs/changes/20/1020/2", secondChange.getHash());
+
+    GitLogEntry previous = createBaseDestinationChange(destination);
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=%s
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL, label),
+        "some content");
+
+    // Make sure commit adds new text
+    String showResult = git("--git-dir", repoGitDir.toString(), "show", primaryBranch);
+    assertThat(showResult).contains("some content");
+
+    GitTesting.assertThatCheckout(repo(), primaryBranch)
+        .containsFile("test.txt", "some content")
+        .containsFile("ignore_me", "")
+        .containsNoMoreFiles();
+
+    GitLogEntry merge = getLastMigratedChange(primaryBranch);
+    assertThat(merge.body()).isEqualTo("Merge Gerrit change 1020 Patch Set 1\n"
+        + "\n"
+        + "DummyOrigin-RevId: test\n"
+        + "Change-Id: " + CHANGE_ID + "\n");
+
+    assertThat(Lists.transform(merge.parents(), GitRevision::getHash))
+        .isEqualTo(Lists.newArrayList(previous.commit().getHash(), firstChange.getHash()));
+
+    assertThat(console.getMessages().stream()
+        .filter(e -> e.getType() == MessageType.WARNING)
+        .findAny().get().getText())
+        .contains("Change 1020 has more patch sets after Patch Set 1."
+            + " Latest is Patch Set 2. Not all changes might be migrated");
+  }
+
+  @Test
+  public void testGerritFakeMergeNoChangeId()
+      throws ValidationException, IOException, RepoException {
+    GitDestination destination = destination(FAKE_MERGE);
+    migrateOriginChange(destination, "Base change\n", "not important 2");
+
+    Path workTree = Files.createTempDirectory("test");
+    GitRepository repo =
+        gitUtil.mockRemoteRepo("example.com/gerrit", repoFormat).withWorkTree(workTree);
+    repo.simpleCommand("pull", "file://" + repoGitDir);
+
+    String label = new GerritIntegrateLabel(repo, options.general, "https://example.com/gerrit",
+        1020, 1, /*changeId=*/null).toString();
+
+    assertThat(label).isEqualTo("gerrit https://example.com/gerrit 1020 Patch Set 1");
+
+    GitRevision firstChange = singleChange(workTree, repo, "ignore_me", "Feature1 change");
+
+    repo.simpleCommand("update-ref", "refs/changes/20/1020/1", firstChange.getHash());
+    GitTestUtil.createFakeGerritNodeDbMeta(repo, 1020, CHANGE_ID);
+
+    GitLogEntry previous = createBaseDestinationChange(destination);
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change
+
+            %s=%s
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL, label),
+        "some content");
+
+    // Make sure commit adds new text
+    String showResult = git("--git-dir", repoGitDir.toString(), "show", primaryBranch);
+    assertThat(showResult).contains("some content");
+
+    GitTesting.assertThatCheckout(repo(), primaryBranch)
+        .containsFile("test.txt", "some content")
+        .containsNoMoreFiles();
+
+    GitLogEntry merge = getLastMigratedChange(primaryBranch);
+    assertThat(merge.body())
+        .isEqualTo(
+            """
+            Merge Gerrit change 1020 Patch Set 1
+
+            DummyOrigin-RevId: test
+            """);
+
+    assertThat(Lists.transform(merge.parents(), GitRevision::getHash))
+        .isEqualTo(Lists.newArrayList(previous.commit().getHash(), firstChange.getHash()));
+
+    assertThat(console.getMessages().stream()
+        .filter(e -> e.getType() == MessageType.WARNING)
+        .findAny())
+        .isEqualTo(Optional.empty());
+  }
+
+  @Test
+  public void testIntegrateWithCustomMergeMessage() throws Exception {
+    Path repoPath = Files.createTempDirectory("test");
+
+    // Create a common baseline between the two repos
+    GitDestination destination =
+        destination(
+            "url = '" + url + "'",
+            String.format("push = '%s'", primaryBranch),
+            String.format("fetch = '%s'", primaryBranch),
+            "integrates = [git.integrate(strategy = 'FAKE_MERGE',merge_commit_message = 'Custom:"
+                + " ${SUMMARY_FROM_TRANSFORM} | ${MERGE_MSG} | ${CONTEXT_REFERENCE}')]");
+    migrateOriginChange(destination, "Base change\n", "not important");
+
+    GitRepository repo =
+        GitRepository.newRepo(/*verbose*/ true, repoPath, getGitEnv()).init(repoFormat);
+    repo.simpleCommand("pull", "file://" + repoGitDir);
+
+    GitRevision feature1 = singleChange(repoPath, repo, "ignore_me", "Feature1 change");
+    repo.branch("feature1").run();
+
+    migrateOriginChange(destination, "Base change 2\n", "not important 2");
+    GitLogEntry previous = getLastMigratedChange(primaryBranch);
+
+    Function<String, Collection<String>> labelFinder =
+        name -> {
+          if (name.equals("CONTEXT_REFERENCE")) {
+            return ImmutableList.of("test_context_ref");
+          }
+          return ImmutableList.of();
+        };
+
+    migrateOriginChange(
+        destination,
+        String.format(
+            """
+            Test change summary
+
+            %1$s=file://%2$s feature1
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL, repo.getWorkTree()),
+        "test.txt",
+        "some content",
+        "test",
+        labelFinder);
+
+    GitLogEntry feature1Merge = getLastMigratedChange(primaryBranch);
+
+    String expectedDefaultMergeMsg =
+        "Merge of " + feature1.getHash() + "\n\n" + DummyOrigin.LABEL_NAME + ": test\n";
+    String expectedSummary =
+        String.format(
+            """
+            Test change summary
+
+            %1$s=file://%2$s feature1
+            """,
+            GitModule.DEFAULT_INTEGRATE_LABEL, repo.getWorkTree());
+
+    String expectedBody =
+        "Custom: " + expectedSummary + " | " + expectedDefaultMergeMsg + " | test_context_ref\n";
+
+    assertThat(feature1Merge.body()).isEqualTo(expectedBody);
+  }
+
+  private GitLogEntry createBaseDestinationChange(GitDestination destination)
+      throws IOException, RepoException, ValidationException {
+    migrateOriginChange(destination, "Base change\n", "not important");
+    GitLogEntry previous = getLastMigratedChange(primaryBranch);
+
+    console.clearMessages();
+    return previous;
+  }
+
+  private GitDestination destinationWithDefaultIntegrates() throws ValidationException {
+    return destination("url = '" + url + "'",
+        String.format("push = '%s'", primaryBranch),
+        String.format("fetch = '%s'", primaryBranch));
+  }
+
+  private GitRevision singleChange(Path workTree, GitRepository repo, String file, String msg)
+      throws IOException, RepoException, CannotResolveRevisionException {
+    String fileContent = "";
+    return singleChange(workTree, repo, file, fileContent, msg);
+  }
+
+  private GitRevision singleChange(Path workTree, GitRepository repo, String file,
+      String fileContent, String msg)
+      throws IOException, RepoException, CannotResolveRevisionException {
+    Path path = workTree.resolve(file);
+    Files.createDirectories(path.getParent());
+    Files.write(path, fileContent.getBytes(StandardCharsets.UTF_8));
+    repo.add().all().run();
+    repo.simpleCommand("commit", "-m", msg);
+    return repo.resolveReference("HEAD");
+  }
+
+  private GitLogEntry getLastMigratedChange(String ref) throws RepoException {
+    return getLastMigratedChange(ref, repo());
+  }
+
+  private GitLogEntry getLastMigratedChange(String ref, GitRepository repo) throws RepoException {
+    return Iterables.getOnlyElement(repo.log(ref)
+        .withLimit(1)
+        .includeFiles(true).includeMergeDiff(true)
+        .run());
+  }
+
+  @Test
+  public void testBadLabel() throws ValidationException, IOException, RepoException {
+    ValidationException e =
+        assertThrows(ValidationException.class, () -> runBadLabel(/*ignoreErrors=*/ false));
+    assertThat(e.getMessage()).contains("Error resolving file:///non_existent_repository");
+  }
+
+  @Test
+  public void testBadLabel_ignoreErrors() throws ValidationException, IOException, RepoException {
+    runBadLabel(/*ignoreErrors=*/true);
+
+    GitTesting.assertThatCheckout(repo(), primaryBranch)
+        .containsFile("test.txt", "some content")
+        .containsNoMoreFiles();
+  }
+
+  private void runBadLabel(boolean ignoreErrors)
+      throws ValidationException, IOException, RepoException {
+    GitDestination destination = destination(
+        "url = '" + url + "'",
+        String.format("fetch = '%s'", primaryBranch),
+        String.format("push = '%s'", primaryBranch),
+        "integrates = [git.integrate( "
+            + "        ignore_errors = " + (ignoreErrors ? "True" : "False")
+            + "    ),]");
+    migrateOriginChange(destination, "Test change\n"
+        + "\n"
+        + GitModule.DEFAULT_INTEGRATE_LABEL + "=file:///non_existent_repository\n", "some content");
+  }
+
+  @Test
+  public void integrate_fetchingError_throwsWhenTemporaryFeatureEnabled() throws Exception {
+    Path repoPath = Files.createTempDirectory("test");
+    GitRepository repo = repo().withWorkTree(repoPath);
+    options.general.setTemporaryFeaturesForTest(
+        ImmutableMap.of("GIT_INTEGRATE_FAIL_IF_COMMON_BASELINE_NOT_FOUND", "true"));
+    gitUtil.mockRemoteRepo("github.com/example/test_repo", repoFormat).withWorkTree(repoPath);
+
+    GitRevision unused =
+        singleChange(repoPath, repo, "base_change.txt", "not important", "Base change\n");
+    GitDestination destination = destinationWithDefaultIntegrates();
+    migrateOriginChange(destination, "Base change\n", "test.txt", "not important", "test");
+
+    // SHA-1 is 40 hex characters.
+    String invalidSha =
+        repoFormat == GitHashAlgorithm.SHA256
+            ? "0000000000000000000000000000000000000000000000000000000000000001"
+            : "0000000000000000000000000000000000000001";
+    String invalidLabel =
+        GitModule.DEFAULT_INTEGRATE_LABEL
+            + "=https://github.com/example/test_repo/pull/0 from "
+            + invalidSha;
+
+    assertThrows(
+        CannotIntegrateException.class,
+        () -> migrateOriginChange(destination, "Test change\n\n" + invalidLabel + "\n", "content"));
+    console
+        .assertThat()
+        .onceInLog(
+            MessageType.WARNING, "failIfIntegrateCommitNotFound is true, re-throwing exception");
+  }
+
+  @Test
+  public void integrate_fetchingError_doesNotThrowWhenTemporaryFeatureDisabled() throws Exception {
+    Path repoPath = Files.createTempDirectory("test");
+    GitRepository repo = repo().withWorkTree(repoPath);
+    options.general.setTemporaryFeaturesForTest(
+        ImmutableMap.of("GIT_INTEGRATE_FAIL_IF_COMMON_BASELINE_NOT_FOUND", "false"));
+    gitUtil.mockRemoteRepo("github.com/example/test_repo", repoFormat).withWorkTree(repoPath);
+
+    GitRevision unused =
+        singleChange(repoPath, repo, "base_change.txt", "not important", "Base change\n");
+    GitDestination destination = destinationWithDefaultIntegrates();
+    migrateOriginChange(destination, "Base change\n", "test.txt", "not important", "test");
+
+    // SHA-1 is 40 hex characters.
+    String invalidSha =
+        repoFormat == GitHashAlgorithm.SHA256
+            ? "0000000000000000000000000000000000000000000000000000000000000001"
+            : "000000000000000000000000000000000000001";
+    String invalidLabel =
+        GitModule.DEFAULT_INTEGRATE_LABEL
+            + "=https://github.com/example/test_repo/pull/0 from "
+            + invalidSha;
+
+    // It should not throw since the temporary feature is false
+    migrateOriginChange(destination, "Test change\n\n" + invalidLabel + "\n", "content");
+
+    console
+        .assertThat()
+        .timesInLog(
+            2,
+            MessageType.WARNING,
+            "Skipping integration for '.*' as the commit could not be resolved");
+  }
+
+  private void migrateOriginChange(GitDestination destination, String summary, String content)
+      throws IOException, RepoException, ValidationException {
+    migrateOriginChange(destination, summary, "test.txt", content, "test");
+  }
+
+  private void migrateOriginChange(GitDestination destination, String summary,
+      String file, String content,
+      String originRef) throws IOException, RepoException, ValidationException {
+    migrateOriginChange(destination, summary, file, content, originRef, ImmutableList::of);
+  }
+
+  private void migrateOriginChange(
+      GitDestination destination,
+      String summary,
+      String file,
+      String content,
+      String originRef,
+      Function<String, Collection<String>> labelFinder)
+      throws IOException, RepoException, ValidationException {
+    WriterContext writerContext =
+        new WriterContext("piper_to_github", "TEST", false, new DummyRevision("test"),
+            Glob.ALL_FILES.roots());
+    Writer<GitRevision> writer = destination.newWriter(writerContext);
+
+    Files.createDirectories(workdir.resolve(file).getParent());
+    Files.write(workdir.resolve(file), content.getBytes(UTF_8));
+    TransformResult result =
+        TransformResults.of(workdir, new DummyRevision(originRef))
+            .withSummary(summary)
+            .withLabelFinder(labelFinder);
+
+    writer.write(result, destinationFiles, console);
+  }
+
+  private GitRepository repo() {
+    return repoForPath(repoGitDir);
+  }
+
+  private GitRepository repoForPath(Path path) {
+    return GitRepository.newBareRepo(
+        path, getGitEnv(),  /*verbose=*/true, DEFAULT_TIMEOUT, /*noVerify=*/ false);
+  }
+
+  private String git(String... argv) throws RepoException {
+    return repo()
+        .git(repoGitDir, argv)
+        .getStdout();
+  }
+}

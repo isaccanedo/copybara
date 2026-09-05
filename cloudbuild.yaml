@@ -1,0 +1,30 @@
+# GCB configuration file
+# To learn more about GCB, go to https://cloud.google.com/container-builder/docs/
+steps:
+- name: 'gcr.io/cloud-builders/docker:latest'
+  args:
+  - "build"
+  - "-f"
+  - "ci.Dockerfile"
+  - "--build-arg"
+  - "BAZEL_VERSION=@sha256:${_BAZEL_SHA256}"
+  - "-t"
+  - "ci"
+  - "."
+# The /builder folder is mounted across steps but owned by root:root
+# HOME=/builder/home
+# https://github.com/GoogleCloudPlatform/cloud-builders/issues/641
+- name: 'ubuntu'
+  args: ["chmod", "-R", "777", "/builder"]
+# Bazel 7.2 symlinks the workspace in a way that causes nested gits in some of our tests
+- name: 'ubuntu'
+  args: ["rm", "-rf", "/workspace/.git"]
+- name: 'ci'
+  args: ["test", "--enable_bzlmod=true", "--java_language_version=25", "--tool_java_language_version=25", "--java_runtime_version=remotejdk_25", "--tool_java_runtime_version=remotejdk_25","--test_output=errors", "--subcommands",  "--sandbox_tmpfs_path=/tmp", "--jobs=1000", "--", "..."]
+options:
+  machine_type: N1_HIGHCPU_32
+substitutions:
+   # https://pantheon.corp.google.com/artifacts/docker/bazel-public/us/gcr.io/bazel
+   # 9.0.0
+  _BAZEL_SHA256: f8a62228137c2decd2a72d609d6e5fbb8074287ce9b6630dc665a94246abc51a
+timeout: 30m

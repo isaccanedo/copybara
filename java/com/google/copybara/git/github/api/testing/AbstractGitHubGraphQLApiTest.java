@@ -1,0 +1,183 @@
+/*
+ * Copyright (C) 2023 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.copybara.git.github.api.testing;
+
+import static com.google.common.truth.Truth.assertThat;
+import static com.google.copybara.testing.git.GitTestUtil.createValidator;
+import static com.google.copybara.testing.git.GitTestUtil.getResource;
+
+import com.google.common.base.Ticker;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
+import com.google.copybara.git.github.api.CheckRun;
+import com.google.copybara.git.github.api.CheckRun.Conclusion;
+import com.google.copybara.git.github.api.CheckRun.Status;
+import com.google.copybara.git.github.api.CommitHistoryResponse;
+import com.google.copybara.git.github.api.CommitHistoryResponse.AssociatedPullRequestNode;
+import com.google.copybara.git.github.api.CommitHistoryResponse.HistoryNode;
+import com.google.copybara.git.github.api.GitHubApiTransport;
+import com.google.copybara.git.github.api.GitHubApp;
+import com.google.copybara.git.github.api.GitHubGraphQLApi;
+import com.google.copybara.git.github.api.GitHubGraphQLApi.GraphQLRequest;
+import com.google.copybara.profiler.LogProfilerListener;
+import com.google.copybara.profiler.Profiler;
+import com.google.copybara.testing.git.GitTestUtil.JsonValidator;
+import java.util.Objects;
+import java.util.function.Predicate;
+import org.junit.Before;
+import org.junit.Test;
+import org.mockito.junit.MockitoJUnit;
+
+/**
+ * Base test to run the same tests on various implementations of the GitHubApiTransport for
+ * GitHubGraphQLApi
+ */
+public abstract class AbstractGitHubGraphQLApiTest {
+
+  protected Profiler profiler;
+  protected GitHubGraphQLApi api;
+
+  @Before
+  public void setUpFramework() throws Exception {
+    MockitoJUnit.rule();
+    profiler = new Profiler(Ticker.systemTicker());
+    profiler.init(ImmutableList.of(new LogProfilerListener()));
+    api = new GitHubGraphQLApi(getTransport(), profiler);
+  }
+
+  public abstract GitHubApiTransport getTransport() throws Exception;
+
+  public abstract void trainMockPost(Predicate<String> validator, byte[] response);
+
+  @Test
+  public void testGetCommitHistory() throws Exception {
+    JsonValidator<GraphQLRequest> validator =
+        createValidator(
+            GraphQLRequest.class,
+            (r) -> {
+              assertThat(r.getVariables().get("numberOfCommits")).isInstanceOf(Number.class);
+              assertThat(((Number) r.getVariables().get("numberOfCommits")).intValue())
+                  .isEqualTo(5);
+              assertThat(r.getVariables().get("numberOfReviews")).isInstanceOf(Number.class);
+              assertThat(((Number) r.getVariables().get("numberOfReviews")).intValue())
+                  .isEqualTo(5);
+              assertThat(r.getVariables().get("numberOfPRs")).isInstanceOf(Number.class);
+              assertThat(((Number) r.getVariables().get("numberOfPRs")).intValue()).isEqualTo(5);
+              assertThat(r.getQuery()).contains("query");
+              return true;
+            });
+    trainMockPost(validator, getResource("commit_history_testdata.json"));
+    CommitHistoryResponse response =
+        api.getCommitHistory(
+            "org_name", "repo_name", "main", new GitHubGraphQLApi.GetCommitHistoryParams(5, 5, 5));
+    // commit_history_testdata.json specific assertions
+    HistoryNode commitNode =
+        Iterables.getOnlyElement(
+            response.getData().getRepository().getRef().getTarget().getHistoryNodes().getNodes());
+    assertThat(
+            commitNode.getAssociatedPullRequests().getEdges().stream()
+                .allMatch(
+                    review -> {
+                      AssociatedPullRequestNode prNode = review.getNode();
+                      String prAuthor = prNode.getAuthor().getLogin();
+                      String prStatus = prNode.getReviewDecision();
+                      String reviewer =
+                          Iterables.getOnlyElement(prNode.getLatestOpinionatedReviews().getEdges())
+                              .getNode()
+                              .getAuthor()
+                              .getLogin();
+                      String reviewerDecision =
+                          Iterables.getOnlyElement(prNode.getLatestOpinionatedReviews().getEdges())
+                              .getNode()
+                              .getState();
+                      return prAuthor.equals("copybara_author")
+                          && prStatus.equals("APPROVED")
+                          && reviewerDecision.equals("APPROVED")
+                          && reviewer.equals("copybara_reviewer");
+                    }))
+        .isTrue();
+  }
+
+  @Test
+  public void testGetCheckRuns() throws Exception {
+    JsonValidator<GraphQLRequest> initialValidator =
+        createValidator(
+            GraphQLRequest.class,
+            (r) -> {
+              if (r.getVariables().get("suiteCursor") != null) {
+                return false;
+              }
+              assertThat(r.getVariables().get("owner")).isEqualTo("google");
+              assertThat(r.getVariables().get("repo")).isEqualTo("copybara");
+              assertThat(r.getVariables().get("sha")).isEqualTo("123456");
+              assertThat(r.getQuery()).contains("checkSuites");
+              assertThat(r.getQuery()).contains("filter_0");
+              assertThat(r.getQuery()).contains("filter_1");
+              return true;
+            });
+    JsonValidator<GraphQLRequest> pageValidator =
+        createValidator(
+            GraphQLRequest.class,
+            (r) -> {
+              if (!Objects.equals(r.getVariables().get("suiteCursor"), "cursor_1")) {
+                return false;
+              }
+              assertThat(r.getVariables().get("owner")).isEqualTo("google");
+              assertThat(r.getVariables().get("repo")).isEqualTo("copybara");
+              assertThat(r.getVariables().get("sha")).isEqualTo("123456");
+              assertThat(r.getQuery()).contains("checkSuites");
+              return true;
+            });
+    trainMockPost(initialValidator, getResource("get_filtered_check_runs_page_one_testdata.json"));
+    trainMockPost(pageValidator, getResource("get_filtered_check_runs_page_two_testdata.json"));
+
+    ImmutableList<CheckRun> checkRuns =
+        api.getCheckRunsByNameFilter(
+            "google", "copybara", "123456", ImmutableSet.of("cla/google", "All Blocking Tests"));
+
+    assertThat(checkRuns)
+        .containsExactly(
+            new CheckRun(
+                "https://ci.example.com/cla",
+                Status.COMPLETED,
+                Conclusion.SUCCESS,
+                "123456",
+                "cla/google",
+                new GitHubApp(1, "github-actions", "GitHub Actions"),
+                null,
+                ImmutableList.of(new CheckRun.PullRequest(1234))),
+            new CheckRun(
+                "https://ci.example.com/blocking",
+                Status.COMPLETED,
+                Conclusion.SUCCESS,
+                "123456",
+                "All Blocking Tests",
+                new GitHubApp(1, "github-actions", "GitHub Actions"),
+                null,
+                ImmutableList.of(new CheckRun.PullRequest(1234))),
+            new CheckRun(
+                "https://ci.example.com/cla2",
+                Status.COMPLETED,
+                Conclusion.SUCCESS,
+                "123456",
+                "cla/google",
+                new GitHubApp(1, "github-actions", "GitHub Actions"),
+                null,
+                ImmutableList.of(new CheckRun.PullRequest(1234))));
+  }
+}

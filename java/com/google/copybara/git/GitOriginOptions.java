@@ -1,0 +1,110 @@
+/*
+ * Copyright (C) 2016 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.copybara.git;
+
+import com.beust.jcommander.Parameter;
+import com.beust.jcommander.Parameters;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableMap;
+import com.google.copybara.GeneralOptions;
+import com.google.copybara.Option;
+import com.google.copybara.approval.ApprovalsProvider;
+import com.google.copybara.approval.NoneApprovedProvider;
+import com.google.copybara.exception.RepoException;
+import com.google.copybara.jcommander.MapConverter;
+import com.google.copybara.util.OriginUtil.CheckoutHook;
+import java.nio.file.Path;
+
+/** Options for {@link GitOrigin}. */
+@Parameters(separators = "=")
+public class GitOriginOptions implements Option {
+
+  @Parameter(names = "--git-origin-checkout-hook",
+      description = "A command to be executed when a checkout happens for a git origin."
+          + " DON'T USE IT. The only intention is to run tools that gather dependencies"
+          + " after the checkout.", hidden = true)
+  String originCheckoutHook = null;
+
+  @Parameter(names = "--git-origin-rebase-ref",
+      description = "When importing a change from a Git origin ref, it will be rebased to this ref,"
+          + " if set. A common use case: importing a Github PR, rebase it to the main branch "
+          + "(usually 'master'). Note that, if the repo uses submodules, they won't be rebased.")
+  String originRebaseRef = null;
+
+  @Parameter(names = "--git-origin-describe-default", description = "The default for git describe"
+      + "in git.*origin.", arity = 1, hidden = true)
+  boolean gitDescribeDefault = true;
+
+  @Parameter(names = "--nogit-origin-version-selector", description = "Disable the version selector"
+      + " for the migration. Only useful for forcing a migration to the passed version in the CLI")
+  boolean noGitVersionSelector = false;
+
+  @Parameter(names = "--git-origin-log-batch", description = "Read the origin git log in batches of"
+      + " n commits. Might be needed for large migrations resulting in git logs of more than 1 GB.")
+  int gitOriginLogBatchSize = 0;
+
+  @Parameter(names = "--git-origin-non-linear-history", arity = 1,
+      description = "Read the full git log and skip changes before the from ref rather than using "
+          + "a log path.")
+  boolean historyIsNonLinear = false;
+
+  public boolean useGitVersionSelector() {
+    return !noGitVersionSelector;
+  }
+
+  @Parameter(
+      names = "--git-fuzzy-last-rev",
+      description =
+          "By default Copybara will try to migrate the revision listed as the version in"
+              + " the metadata file from github. This flag tells Copybara to first find the git tag"
+              + " which most closely matches the metadata version, and use that for the"
+              + " migration.", arity = 1)
+  boolean gitFuzzyLastRev = false;
+
+  public boolean useGitFuzzyLastRev() {
+    return gitFuzzyLastRev;
+  }
+
+  @Parameter(
+      names = "--last-rev-map",
+      converter = MapConverter.class,
+      description =
+          """
+          Explicit mapping (old_hash:new_hash) to bridge a repository hash algorithm transition \
+          e.g. SHA1 to SHA256, as last-rev cannot be used with CaaS. \
+          Example: --last-rev-map=99ab4b1306bd3ca616ce78de796f2b86ac7c9265:703a58eebcfb2e5ef46e8cb4\
+          ca9399df2196fbde9c325603ed61ce7b848bb248. Multiple comma separated mappings \
+          are supported.
+          """)
+  @VisibleForTesting
+  ImmutableMap<String, String> lastRevisionMap = ImmutableMap.of();
+
+  public ImmutableMap<String, String> getLastRevisionMap() {
+    return lastRevisionMap;
+  }
+
+  public ApprovalsProvider approvalsProvider = new NoneApprovedProvider();
+
+  void maybeRunCheckoutHook(Path checkoutDir, GeneralOptions generalOptions) throws RepoException {
+    if (Strings.isNullOrEmpty(originCheckoutHook)) {
+      return;
+    }
+    CheckoutHook checkoutHook = new CheckoutHook(originCheckoutHook, generalOptions, "git.origin");
+    checkoutHook.run(checkoutDir);
+  }
+}

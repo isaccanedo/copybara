@@ -1,0 +1,584 @@
+/*
+ * Copyright (C) 2016 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.copybara.git;
+
+import com.google.common.base.MoreObjects;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
+import com.google.common.flogger.FluentLogger;
+import com.google.copybara.ChangeMessage;
+import com.google.copybara.GeneralOptions;
+import com.google.copybara.LabelFinder;
+import com.google.copybara.TransformResult;
+import com.google.copybara.exception.RepoException;
+import com.google.copybara.exception.ValidationException;
+import com.google.copybara.git.GitDestination.MessageInfo;
+import com.google.copybara.git.GitRepository.GitLogEntry;
+import com.google.copybara.git.GitRepository.StatusCode;
+import com.google.copybara.git.GitRepository.StatusFile;
+import com.google.copybara.profiler.Profiler.ProfilerTask;
+import com.google.copybara.templatetoken.LabelTemplate;
+import com.google.copybara.util.DiffUtil;
+import com.google.copybara.util.DirFactory;
+import com.google.copybara.util.console.Console;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import net.starlark.java.annot.StarlarkBuiltin;
+import net.starlark.java.eval.StarlarkValue;
+
+/** Integrate changes from a url present in the migrated change label. */
+@StarlarkBuiltin(
+    name = "git_integrate",
+    documented = false,
+    doc = "")
+public class GitIntegrateChanges implements StarlarkValue {
+
+  private static final FluentLogger logger = FluentLogger.forEnclosingClass();
+  private static final LabelTemplate DEFAULT_MERGE_MSG_TEMPLATE = new LabelTemplate("${MERGE_MSG}");
+
+  private final String label;
+  private final Strategy strategy;
+  private final boolean ignoreErrors;
+  private final boolean allowUnrelatedHistory;
+  private final LabelTemplate mergeCommitMessage;
+
+  GitIntegrateChanges(String label, Strategy strategy, boolean ignoreErrors) {
+    this(
+        label,
+        strategy,
+        ignoreErrors,
+        /* allowUnrelatedHistory= */ false,
+        DEFAULT_MERGE_MSG_TEMPLATE);
+  }
+
+  GitIntegrateChanges(
+      String label, Strategy strategy, boolean ignoreErrors, boolean allowUnrelatedHistory) {
+    this(label, strategy, ignoreErrors, allowUnrelatedHistory, DEFAULT_MERGE_MSG_TEMPLATE);
+  }
+
+  GitIntegrateChanges(
+      String label,
+      Strategy strategy,
+      boolean ignoreErrors,
+      boolean allowUnrelatedHistory,
+      LabelTemplate mergeCommitMessage) {
+    this.label = Preconditions.checkNotNull(label);
+    this.strategy = Preconditions.checkNotNull(strategy);
+    this.ignoreErrors = ignoreErrors;
+    this.allowUnrelatedHistory = allowUnrelatedHistory;
+    this.mergeCommitMessage = Preconditions.checkNotNull(mergeCommitMessage);
+  }
+
+
+  /**
+   * Perform an integrate of changes for matching labels in the existing {@code repository} HEAD.
+   *
+   * @throws CannotIntegrateException if a change cannot be integrated due to a user error
+   * @throws RepoException if a git related error happens during the integrate
+   */
+  // TODO(joshgoldman): Add unit tests for checking the return value of integrate.run()
+  Optional<IntegrateLabel> run(
+      GitRepository repository,
+      String repoUrl,
+      GeneralOptions generalOptions,
+      MessageInfo messageInfo,
+      Predicate<String> externalFileMatcher,
+      TransformResult result,
+      boolean ignoreIntegrationErrors)
+      throws CannotIntegrateException, RepoException {
+    Optional<IntegrateLabel> integrateLabel = Optional.empty();
+    try {
+      integrateLabel =
+          doIntegrate(
+              repository, repoUrl, generalOptions, externalFileMatcher, result, messageInfo);
+    } catch (CannotIntegrateException e) {
+      if (ignoreIntegrationErrors || ignoreErrors) {
+        logger.atWarning().withCause(e).log("Cannot integrate changes");
+        generalOptions.console().warnFmt("Cannot integrate changes: %s", e.getMessage());
+      } else {
+        throw e;
+      }
+    } catch (RepoException e) {
+      if (ignoreIntegrationErrors || ignoreErrors) {
+        logger.atSevere().withCause(e).log("Cannot integrate changes");
+        generalOptions.console().warnFmt("Cannot integrate changes: %s", e.getMessage());
+      } else {
+        throw e;
+      }
+    }
+    return integrateLabel;
+  }
+
+  private Optional<IntegrateLabel> doIntegrate(
+      GitRepository repository,
+      String repoUrl,
+      GeneralOptions generalOptions,
+      Predicate<String> externalFiles,
+      TransformResult result,
+      MessageInfo messageInfo)
+      throws CannotIntegrateException, RepoException {
+    Optional<IntegrateLabel> optionalIntegrateLabel = Optional.empty();
+    for (LabelFinder label : result.findAllLabels()) {
+      if (!label.isLabel() || !this.label.equals(label.getName())) {
+        continue;
+      }
+      if (Strings.isNullOrEmpty(label.getValue())) {
+        throw new CannotIntegrateException("Found an empty value for label " + this.label);
+      }
+      try (ProfilerTask ignore =
+          generalOptions.profiler().start("integrate", ImmutableMap.of("URL", label.getValue()))) {
+        generalOptions
+            .console()
+            .progressFmt(
+                "Integrating change from '%s' using strategy %s", label.getValue(), strategy);
+        IntegrateLabel integrateLabel =
+            GitHubPrIntegrateLabel.parse(label.getValue(), repository, generalOptions);
+        if (integrateLabel == null) {
+          integrateLabel = GerritIntegrateLabel.parse(label.getValue(), repository, generalOptions);
+          if (integrateLabel == null) {
+            // would derive url from repo remote, but there is no guarantee a remote is configured.
+            GitRevision gitRevision =
+                GitRepoType.GIT.resolveRef(
+                    repository,
+                    repoUrl,
+                    label.getValue(),
+                    generalOptions,
+                    /* describeVersion= */ false,
+                    /* partialFetch= */ false, Optional.empty());
+            integrateLabel = IntegrateLabel.genericGitRevision(gitRevision);
+          }
+        }
+
+        strategy.integrate(
+            repository,
+            integrateLabel,
+            externalFiles,
+            label,
+            messageInfo,
+            generalOptions.console(),
+            generalOptions.getDirFactory(),
+            generalOptions.isTemporaryFeature(
+                "GIT_INTEGRATE_FAIL_IF_COMMON_BASELINE_NOT_FOUND", false),
+            allowUnrelatedHistory,
+            mergeCommitMessage,
+            result);
+        optionalIntegrateLabel = Optional.of(integrateLabel);
+      } catch (ValidationException e) {
+        throw new CannotIntegrateException("Error resolving " + label.getValue(), e);
+      }
+    }
+    return optionalIntegrateLabel;
+  }
+
+  /**
+   * What should we do when we find a change to be integrated
+   */
+  public enum Strategy {
+    /**
+     * A simple git fake-merge: Ignore any content from the change url.
+     */
+    FAKE_MERGE {
+      @Override
+      void integrate(
+          GitRepository repository,
+          IntegrateLabel integrateLabel,
+          Predicate<String> externalFiles,
+          LabelFinder rawLabelValue,
+          MessageInfo messageInfo,
+          Console console,
+          DirFactory dirFactory,
+          boolean failIfIntegrateCommitNotFound,
+          boolean allowUnrelatedHistory,
+          LabelTemplate mergeCommitMessage,
+          TransformResult result)
+          throws ValidationException, RepoException {
+        GitLogEntry head = getHeadCommit(repository);
+
+        if (!allowUnrelatedHistory
+            && findCommonBaseline(
+                    repository, integrateLabel, head, failIfIntegrateCommitNotFound, console)
+                .isEmpty()) {
+          console.warnFmt("Skipping creation of merge for '%s' as Copybara cannot find a common"
+              + " parent. This normally means that the integrate label reference is for an"
+              + " unrelated repository", integrateLabel);
+          return;
+        }
+
+        String defaultMergeMessage = integrateLabel.mergeMessage(messageInfo.labelsToAdd);
+
+        Function<String, String> customLabelFinder =
+            name -> {
+              if (name.equals("SUMMARY_FROM_TRANSFORM")) {
+                return result.getSummary();
+              }
+              if (name.equals("MERGE_MSG")) {
+                return defaultMergeMessage;
+              }
+              Collection<String> values = result.getLabelFinder().apply(name);
+              return (values == null || values.isEmpty()) ? null : Iterables.getFirst(values, null);
+            };
+
+        String msg;
+        try {
+          msg = mergeCommitMessage.resolve(customLabelFinder);
+        } catch (LabelTemplate.LabelNotFoundException e) {
+          throw new CannotIntegrateException(
+              String.format(
+                  "Cannot find '%s' label for template '%s'", e.getLabel(), mergeCommitMessage),
+              e);
+        }
+
+        Optional<GitRevision> integrateRevision =
+            resolveIntegrateRevision(integrateLabel, failIfIntegrateCommitNotFound, console);
+        if (integrateRevision.isEmpty()) {
+          return;
+        }
+
+        // If there is already a merge, don't overwrite the merge but create a new one.
+        // Otherwise amend the last commit as a merge.
+        GitRevision commit = head.parents().size() > 1
+                             ? repository.commitTree(msg, head.tree(),
+            ImmutableList.of(head.commit(), integrateRevision.get()))
+                             : repository.commitTree(msg, head.tree(),
+                                 ImmutableList.<GitRevision>builder().addAll(head.parents())
+                                     .add(integrateRevision.get()).build());
+        repository.simpleCommand("update-ref", "HEAD", commit.getHash());
+      }
+    },
+    /**
+     * An hybrid that includes the changes that don't match destination_files but fake-merges
+     * the rest.
+     */
+    FAKE_MERGE_AND_INCLUDE_FILES {
+      @Override
+      void integrate(
+          GitRepository repository,
+          IntegrateLabel gitRevision,
+          Predicate<String> externalFiles,
+          LabelFinder rawLabelValue,
+          MessageInfo messageInfo,
+          Console console,
+          DirFactory dirFactory,
+          boolean failIfIntegrateCommitNotFound,
+          boolean allowUnrelatedHistory,
+          LabelTemplate mergeCommitMessage,
+          TransformResult result)
+          throws ValidationException, RepoException {
+        // Fake merge first so that we have a commit and then amend that commit wit the external
+        // files
+        FAKE_MERGE.integrate(
+            repository,
+            gitRevision,
+            externalFiles,
+            rawLabelValue,
+            messageInfo,
+            console,
+            dirFactory,
+            failIfIntegrateCommitNotFound,
+            allowUnrelatedHistory,
+            mergeCommitMessage,
+            result);
+        INCLUDE_FILES.integrate(
+            repository,
+            gitRevision,
+            externalFiles,
+            rawLabelValue,
+            messageInfo,
+            console,
+            dirFactory,
+            failIfIntegrateCommitNotFound,
+            allowUnrelatedHistory,
+            mergeCommitMessage,
+            result);
+      }
+    },
+    /**
+     * Include changes that don't match destination_files but don't create a merge commit.
+     */
+    INCLUDE_FILES {
+      @Override
+      void integrate(
+          GitRepository repository,
+          IntegrateLabel integrateLabel,
+          Predicate<String> externalFiles,
+          LabelFinder rawLabelValue,
+          MessageInfo messageInfo,
+          Console console,
+          DirFactory dirFactory,
+          boolean failIfIntegrateCommitNotFound,
+          boolean allowUnrelatedHistory,
+          LabelTemplate mergeCommitMessage,
+          TransformResult result)
+          throws ValidationException, RepoException {
+        // Save HEAD commit before starting messing with the repo
+        GitLogEntry head = getHeadCommit(repository);
+        byte[] diff;
+        // TODO(b/188914756): This doesn't support binaries well. We should fix it.
+        diff =
+            computeExternalDiff(
+                repository,
+                integrateLabel,
+                externalFiles,
+                head,
+                failIfIntegrateCommitNotFound,
+                console);
+        if (diff.length == 0) {
+          return;
+        }
+        try {
+          // Apply the patch to the current branch.
+          repository.apply(diff, /*index=*/true);
+        } catch (RebaseConflictException e) {
+          // Add more context information
+          throw new CannotIntegrateException("Cannot apply the changes from " + integrateLabel, e);
+        }
+
+        List<String> toRevert = new ArrayList<>();
+        for (StatusFile statusFile : repository.status()) {
+          // Just in case the worktree is dirty
+          if (statusFile.indexStatus() == StatusCode.UNMODIFIED) {
+            continue;
+          }
+          if (statusFile.indexStatus() == StatusCode.COPIED) {
+            revertIfInternal(toRevert, externalFiles, statusFile.newFileName());
+          } else if (statusFile.indexStatus().equals(StatusCode.RENAMED)) {
+            revertIfInternal(toRevert, externalFiles, statusFile.file());
+            revertIfInternal(toRevert, externalFiles, statusFile.newFileName());
+          } else {
+            revertIfInternal(toRevert, externalFiles, statusFile.file());
+          }
+        }
+        // Batch to prevent going over max arguments length.
+        for (List<String> revertBatch : Lists.partition(toRevert, 20)) {
+          ImmutableList.Builder<String> params = ImmutableList.<String>builder()
+              .add("reset", "HEAD", "--");
+          params.addAll(revertBatch);
+          repository.simpleCommand(params.build().toArray(new String[0]));
+        }
+        ChangeMessage msg = ChangeMessage.parseAllAsLabels(head.body())
+            .withRemovedLabelByNameAndValue(rawLabelValue.getName(), rawLabelValue.getValue());
+
+        // Amend last commit with the external files and remove the integration label
+        try {
+          repository.commit(/*author=*/null, /*amend=*/true, /*timestamp=*/null, msg.toString());
+        } catch (ValidationException ignore) {
+          // This is expected. There might not be any external file
+        }
+        // Cleanup any non-comitted file
+        repository.simpleCommand("reset", "--hard");
+        repository.forceClean();
+      }
+
+      private byte[] computeExternalDiff(
+          GitRepository repository,
+          IntegrateLabel integrateLabel,
+          Predicate<String> externalFiles,
+          GitLogEntry head,
+          boolean failIfIntegrateCommitNotFound,
+          Console console)
+          throws ValidationException, RepoException {
+        Optional<GitRevision> integrateRevision =
+            resolveIntegrateRevision(integrateLabel, failIfIntegrateCommitNotFound, console);
+        if (integrateRevision.isEmpty()) {
+          return new byte[0];
+        }
+        String commonBaseline =
+            findCommonBaseline(
+                    repository, integrateLabel, head, failIfIntegrateCommitNotFound, console)
+                // If common parent cannot be found, it is fine, since this is not using the commit
+                // history but just the content for diffing.
+                .orElse(head.commit().getHash());
+        // Create a patch of the changes from common baseline..feature head.
+        byte[] diffs =
+            repository
+                .simpleCommandNoRedirectOutput(
+                    "diff", commonBaseline + ".." + integrateRevision.get().getHash())
+                .getStdoutBytes();
+        // Filter the diff to the external files changed by the external change that weren't
+        // migrated to the internal repository.
+        return DiffUtil.filterDiff(diffs, externalFiles);
+      }
+
+      private void revertIfInternal(List<String> toRevert, Predicate<String> externalFiles,
+          String file) {
+        if (!externalFiles.test(file)) {
+          toRevert.add(file);
+        }
+      }
+    };
+
+    /**
+     * Tries to find the common commit between HEAD and the integrate label commit. If the integrate
+     * sha cannot be found it defaults to HEAD.
+     *
+     * <p>If the sha can be found but a common parent cannot be found, it returns none. This
+     * normally means that the commit is from an unrelated repository.
+     */
+    private static Optional<String> findCommonBaseline(
+        GitRepository repository,
+        IntegrateLabel integrateLabel,
+        GitLogEntry head,
+        boolean failIfIntegrateCommitNotFound,
+        Console console)
+        throws ValidationException, RepoException {
+      GitRevision previousHead = Iterables.getFirst(head.parents(), null);
+      if (previousHead == null) {
+        return Optional.of(head.commit().getHash());
+      }
+      String sha;
+      try {
+        sha = integrateLabel.getRevision().getHash();
+      } catch (RepoException | ValidationException e) {
+        // There is a weird git submodule issue where the first time we fetch a reference but
+        // the local state (git-tree and workdir) doesn't have a reference to the submodule it
+        // fails trying to get the resolve the submodule. But the main fetch success, so a
+        // call to resolve would return the reference.
+        if (!e.getMessage().contains("Could not access submodule")) {
+          logger.atWarning().withCause(e).log(
+              "Cannot fetch/find integrate commit: %s.", integrateLabel);
+          if (failIfIntegrateCommitNotFound) {
+            logger.atWarning().withCause(e).log(
+                "failIfIntegrateCommitNotFound is true, re-throwing exception.");
+            console.warnFmt(
+                "failIfIntegrateCommitNotFound is true, re-throwing exception: %s", e.getMessage());
+            throw e;
+          }
+          return Optional.of(head.commit().getHash());
+        }
+        try {
+          sha = integrateLabel.getRevision().getHash();
+        } catch (RepoException retryException) {
+          logger.atWarning().withCause(retryException).log(
+              "Cannot fetch/find integrate commit (2nd attempt): %s.", integrateLabel);
+          if (failIfIntegrateCommitNotFound) {
+            logger.atWarning().withCause(retryException).log(
+                "failIfIntegrateCommitNotFound is true, re-throwing retry exception.");
+            console.warnFmt(
+                "failIfIntegrateCommitNotFound is true, re-throwing retry exception: %s",
+                retryException.getMessage());
+            throw retryException;
+          }
+          return Optional.of(head.commit().getHash());
+        }
+      }
+      try {
+        return Optional.of(repository.mergeBase(previousHead.getHash(), sha));
+      } catch (RepoException e) {
+        logger.atWarning().withCause(e).log(
+            "Cannot find common parent for previous head commit %s and integrate commit: %s.",
+            previousHead, integrateLabel);
+        return Optional.empty();
+      }
+    }
+
+    private static GitLogEntry getHeadCommit(GitRepository repository) throws RepoException {
+      return Iterables.getOnlyElement(repository.log("HEAD").withLimit(1).run());
+    }
+
+    private static Optional<GitRevision> resolveIntegrateRevision(
+        IntegrateLabel integrateLabel,
+        boolean failIfIntegrateCommitNotFound,
+        Console console)
+        throws ValidationException, RepoException {
+      try {
+        return Optional.of(integrateLabel.getRevision());
+      } catch (RepoException | ValidationException e) {
+        if (failIfIntegrateCommitNotFound) {
+          throw e;
+        }
+        console.warnFmt(
+            "Skipping integration for '%s' as the commit could not be resolved: %s",
+            integrateLabel, e.getMessage());
+        return Optional.empty();
+      }
+    }
+
+    void integrate(
+        GitRepository repository,
+        IntegrateLabel gitRevision,
+        Predicate<String> externalFiles,
+        LabelFinder rawLabelValue,
+        MessageInfo messageInfo,
+        Console console,
+        DirFactory dirFactory,
+        boolean failIfIntegrateCommitNotFound,
+        boolean allowUnrelatedHistory,
+        LabelTemplate mergeCommitMessage,
+        TransformResult result)
+        throws ValidationException, RepoException {
+      throw new CannotIntegrateException(this + " integrate mode is still not supported");
+    }
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (!(o instanceof GitIntegrateChanges)) {
+      return false;
+    }
+    GitIntegrateChanges that = (GitIntegrateChanges) o;
+    return ignoreErrors == that.ignoreErrors
+        && allowUnrelatedHistory == that.allowUnrelatedHistory
+        && Objects.equals(label, that.label)
+        && strategy == that.strategy
+        && Objects.equals(mergeCommitMessage, that.mergeCommitMessage);
+  }
+
+  public Strategy getStrategy() {
+    return strategy;
+  }
+
+  public String getLabel() {
+    return label;
+  }
+
+  public boolean isAllowUnrelatedHistory() {
+    return allowUnrelatedHistory;
+  }
+
+  public LabelTemplate getMergeCommitMessage() {
+    return mergeCommitMessage;
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(label, strategy, ignoreErrors, allowUnrelatedHistory, mergeCommitMessage);
+  }
+
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("label", label)
+        .add("strategy", strategy)
+        .add("ignoreErrors", ignoreErrors)
+        .add("allowUnrelatedHistory", allowUnrelatedHistory)
+        .add("mergeCommitMessage", mergeCommitMessage)
+        .toString();
+  }
+
+}

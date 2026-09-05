@@ -1,0 +1,215 @@
+/*
+ * Copyright (C) 2020 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.copybara.git.github.util;
+
+import static com.google.common.truth.Truth.assertThat;
+import static org.junit.Assert.assertThrows;
+
+import com.google.common.collect.ImmutableList;
+import com.google.testing.junit.testparameterinjector.TestParameter;
+import com.google.testing.junit.testparameterinjector.TestParameterInjector;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+
+@RunWith(TestParameterInjector.class)
+public final class GitHubIdentifierTest {
+
+  @Test
+  public void testApiUrl_githubDotCom() {
+    String githubDotComUrl = "https://github.com/ownername/reponame";
+
+    GitHubIdentifier identifier = GitHubIdentifier.create(githubDotComUrl);
+
+    assertThat(identifier.getApiUrl()).isEqualTo("https://api.github.com");
+  }
+
+  @Test
+  public void testApiUrl_githubEnterprise() {
+    String ghesUrl = "https://depot.code.corp.goog/ownername/reponame";
+
+    GitHubIdentifier identifier = GitHubIdentifier.create(ghesUrl);
+
+    assertThat(identifier.getApiUrl()).isEqualTo("https://depot.code.corp.goog/api/v3");
+  }
+
+  @Test
+  public void testValidUrl() {
+    String url = "https://github.com/ownername/reponame";
+
+    GitHubIdentifier identifier = GitHubIdentifier.create(url);
+
+    assertThat(identifier.getHostName()).isEqualTo("github.com");
+    assertThat(identifier.getOwnerOrOrganizationName()).isEqualTo("ownername");
+    assertThat(identifier.getRepoName()).isEqualTo("reponame");
+    assertThat(identifier.getPath()).isEqualTo("ownername/reponame");
+    assertThat(identifier.getUrl()).isEqualTo(url);
+  }
+
+  @Test
+  public void testInvalidPath_tooManySlashes() {
+    String url = "https://github.com/ownername/reponame/extra";
+
+    IllegalArgumentException exception =
+        assertThrows(IllegalArgumentException.class, () -> GitHubIdentifier.create(url));
+
+    assertThat(exception)
+        .hasMessageThat()
+        .contains(
+            "URI path must contain exactly one '/' separating the owner or organization and the"
+                + " repo name.");
+  }
+
+  @Test
+  public void testInvalidPath_tooFewSlashes() {
+    String url = "https://github.com/ownername";
+
+    IllegalArgumentException exception =
+        assertThrows(IllegalArgumentException.class, () -> GitHubIdentifier.create(url));
+
+    assertThat(exception)
+        .hasMessageThat()
+        .contains(
+            "URI path must contain exactly one '/' separating the owner or organization and the"
+                + " repo name.");
+  }
+
+  @Test
+  public void testCreate_invalidOrganizationName(
+      @TestParameter({
+            "-leading-hyphen",
+            "trailing-hyphen-",
+            "consecutive--hyphens",
+            "invalid_underscore",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          })
+          String invalidOrg) {
+    String url = "https://github.com/" + invalidOrg + "/reponame";
+
+    IllegalArgumentException exception =
+        assertThrows(IllegalArgumentException.class, () -> GitHubIdentifier.create(url));
+
+    assertThat(exception)
+        .hasMessageThat()
+        .contains("Invalid owner or organization name: " + invalidOrg);
+  }
+
+  @Test
+  public void testMissingUrl() {
+    assertThrows(NullPointerException.class, () -> GitHubIdentifier.create(null));
+  }
+
+  @Test
+  public void testTrailingSlash() {
+    String url = "https://github.com/ownername/reponame/";
+
+    GitHubIdentifier identifier = GitHubIdentifier.create(url);
+
+    assertThat(identifier.getOwnerOrOrganizationName()).isEqualTo("ownername");
+    assertThat(identifier.getRepoName()).isEqualTo("reponame");
+  }
+
+  @Test
+  public void standardFormats_github() {
+    String githubCom = "github.com";
+    String path = "foo/bar";
+    ImmutableList<String> acceptedFormats =
+        ImmutableList.of(
+            "http://" + githubCom + "/" + path,
+            "https://" + githubCom + "/" + path,
+            "ssh://git@" + githubCom + "/" + path,
+            "sso://git@" + githubCom + "/" + path,
+            "git://" + githubCom + "/" + path,
+            "rpc://" + githubCom + "/" + path);
+
+    for (String acceptedFormat : acceptedFormats) {
+      GitHubIdentifier gitHubIdentifier = GitHubIdentifier.create(acceptedFormat);
+      assertThat(gitHubIdentifier.getHostName()).isEqualTo(githubCom);
+      assertThat(gitHubIdentifier.getPath()).isEqualTo(path);
+      assertThat(gitHubIdentifier.getUrl()).isEqualTo("https://" + githubCom + "/" + path);
+    }
+  }
+
+  @Test
+  public void scpUrlFormatUrl() {
+    String scpUrl = "git@github.com:foo/bar";
+
+    GitHubIdentifier gitHubIdentifier = GitHubIdentifier.create(scpUrl);
+
+    assertThat(gitHubIdentifier.getHostName()).isEqualTo("github.com");
+    assertThat(gitHubIdentifier.getPath()).isEqualTo("foo/bar");
+    assertThat(gitHubIdentifier.getUrl()).isEqualTo("https://github.com/foo/bar");
+  }
+
+  @Test
+  public void noSchemeGitUrlFormat() {
+    String url = "git@github.com/foo/bar";
+
+    GitHubIdentifier gitHubIdentifier = GitHubIdentifier.create(url);
+
+    assertThat(gitHubIdentifier.getHostName()).isEqualTo("github.com");
+    assertThat(gitHubIdentifier.getPath()).isEqualTo("foo/bar");
+    assertThat(gitHubIdentifier.getUrl()).isEqualTo("https://github.com/foo/bar");
+  }
+
+  @Test
+  public void standardFormats_ghes() {
+    String ghes = "depot.code.corp.goog";
+    String path = "foo/bar";
+    ImmutableList<String> acceptedFormats =
+        ImmutableList.of(
+            "http://" + ghes + "/" + path,
+            "https://" + ghes + "/" + path,
+            "http://www." + ghes + "/" + path,
+            "https://www." + ghes + "/" + path,
+            "http://" + ghes + "/" + path + ".git");
+
+    for (String acceptedFormat : acceptedFormats) {
+      GitHubIdentifier unused = GitHubIdentifier.create(acceptedFormat);
+    }
+  }
+
+  @Test
+  public void stripGitSuffix() {
+    String url = "https://github.com/ownername/reponame.git";
+
+    GitHubIdentifier identifier = GitHubIdentifier.create(url);
+
+    assertThat(identifier.getRepoName()).isEqualTo("reponame");
+  }
+
+  @Test
+  public void testIsValidOrganizationName_happyCases(
+      @TestParameter({"google", "fog-3p-actions", "a", "12345", "a-b-c-d"}) String orgName) {
+    assertThat(GitHubIdentifier.isValidOrganizationName(orgName)).isTrue();
+  }
+
+  @Test
+  public void testInvalidOrganizationName_unhappyCases(
+      @TestParameter({
+            "null",
+            "",
+            "-leading-hyphen",
+            "trailing-hyphen-",
+            "consecutive--hyphens",
+            "invalid_underscore",
+            "invalid space",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          })
+          String orgName) {
+    assertThat(GitHubIdentifier.isValidOrganizationName(orgName)).isFalse();
+  }
+}

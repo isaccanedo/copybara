@@ -1,0 +1,1800 @@
+/*
+ * Copyright (C) 2023 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.google.copybara.regenerate;
+
+import static com.google.common.base.Strings.nullToEmpty;
+import static com.google.common.truth.Truth.assertThat;
+import static com.google.copybara.testing.FileSubjects.assertThatPath;
+import static org.junit.Assert.assertThrows;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.hash.Hashing;
+import com.google.copybara.CommandEnv;
+import com.google.copybara.ConfigLoader;
+import com.google.copybara.Destination.PatchRegenerator;
+import com.google.copybara.DestinationReader;
+import com.google.copybara.ModuleSet;
+import com.google.copybara.WriterContext;
+import com.google.copybara.config.Config;
+import com.google.copybara.config.ConfigFile;
+import com.google.copybara.config.PathBasedConfigFile;
+import com.google.copybara.exception.RepoException;
+import com.google.copybara.exception.ValidationException;
+import com.google.copybara.revision.Revision;
+import com.google.copybara.testing.DummyOrigin;
+import com.google.copybara.testing.OptionsBuilder;
+import com.google.copybara.testing.RecordsProcessCallDestination;
+import com.google.copybara.testing.SkylarkTestExecutor;
+import com.google.copybara.util.ConsistencyFile;
+import com.google.copybara.util.ExitCode;
+import com.google.copybara.util.FileUtil;
+import com.google.copybara.util.FileUtil.CopySymlinkStrategy;
+import com.google.copybara.util.Glob;
+import com.google.copybara.util.console.Console;
+import com.google.copybara.util.console.Message.MessageType;
+import com.google.copybara.util.console.testing.TestingConsole;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.PathMatcher;
+import java.util.Map;
+import java.util.Optional;
+import java.util.regex.Pattern;
+import javax.annotation.Nullable;
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+import org.junit.runner.RunWith;
+import org.junit.runners.JUnit4;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.MockitoJUnit;
+import org.mockito.junit.MockitoRule;
+
+@RunWith(JUnit4.class)
+public class RegenerateCmdTest {
+  private OptionsBuilder options;
+  private SkylarkTestExecutor skylark;
+
+  DummyOrigin origin;
+  RecordsProcessCallDestination destination;
+
+  @Rule public MockitoRule mockitoRule = MockitoJUnit.rule();
+
+  @Mock public PatchRegenerator patchRegenerator;
+
+  @Rule public TemporaryFolder tempFolder = new TemporaryFolder();
+  Path testRoot;
+  Path workdir;
+  Path destinationRoot;
+
+  public Map<String, String> env = System.getenv();
+
+  private static final String CONSISTENCY_FILE_PATH = "test/test.bara.consistency";
+
+  @Before
+  public void setup() throws Exception {
+    options = new OptionsBuilder();
+    options.regenerateOptions = new RegenerateOptions();
+
+    testRoot = tempFolder.getRoot().toPath();
+    workdir = testRoot.resolve("workdir");
+    destinationRoot = testRoot.resolve("destination");
+
+    destination =
+        new RecordsProcessCallDestination() {
+          @Override
+          public Writer<Revision> newWriter(WriterContext writerContext) {
+            return new WriterImpl(
+                writerContext.isDryRun(), writerContext.getOriginalRevision().contextReference()) {
+              @Override
+              public Optional<PatchRegenerator> getPatchRegenerator(Console console) {
+                return Optional.of(patchRegenerator);
+              }
+
+              @Override
+              public DestinationReader getDestinationReader(
+                  Console console, @Nullable String baseline, Path workdir) {
+                return new DestinationReader() {
+                  @Override
+                  public String readFile(String path) throws RepoException {
+                    String destinationSubdir = nullToEmpty(baseline);
+                    try {
+                      return Files.readString(
+                          destinationRoot.resolve(destinationSubdir).resolve(path));
+                    } catch (IOException e) {
+                      throw new RepoException("Error reading file in test", e);
+                    }
+                  }
+
+                  @Override
+                  public void copyDestinationFilesToDirectory(Glob glob, Path directory) {
+                    String destinationSubdir = nullToEmpty(baseline);
+                    Path sourceDirectory = destinationRoot.resolve(destinationSubdir);
+                    try {
+                      FileUtil.copyFilesRecursively(
+                          sourceDirectory,
+                          directory,
+                          CopySymlinkStrategy.IGNORE_INVALID_SYMLINKS,
+                          glob);
+                    } catch (IOException e) {
+                      throw new RuntimeException(e);
+                    }
+                  }
+
+                  @Override
+                  public boolean exists(String path) {
+                    // In this test, 'baseline' can be the destination subdir (e.g., "target")
+                    String destinationSubdir = nullToEmpty(baseline);
+                    return Files.exists(destinationRoot.resolve(destinationSubdir).resolve(path));
+                  }
+
+                  @Override
+                  public void copyDestinationFiles(Object glob, Object path)
+                      throws RepoException, ValidationException {
+                    throw new RepoException("copyDestinationFiles(Object, Object) not implemented");
+                  }
+                };
+              }
+            };
+          }
+        };
+    options.testingOptions.destination = destination;
+
+    origin = new DummyOrigin();
+    origin.addSimpleChange(0);
+    options.testingOptions.origin = origin;
+
+    options.setEnvironment(env);
+
+    skylark = new SkylarkTestExecutor(options);
+  }
+
+  // spoof a pristine baseline for generating baseline consistency files
+  private void setupPristineBaseline(String name) throws IOException {
+    Files.createDirectories(destinationRoot.resolve(name));
+  }
+
+  // generate and write the consistency file from the regen baseline and pristine baseline directory
+  // contents
+  private void setupBaselineConsistencyFile(String pristine, String baseline) throws Exception {
+    ConsistencyFile consistencyFile;
+
+    if (!Files.exists(destinationRoot.resolve(baseline))) {
+      throw new RuntimeException("set up regen baseline before calling");
+    }
+
+    consistencyFile =
+        ConsistencyFile.generate(
+            destinationRoot.resolve(pristine),
+            destinationRoot.resolve(baseline),
+            Hashing.sha256(),
+            env,
+            false);
+
+    writeDestination(baseline, CONSISTENCY_FILE_PATH, consistencyFile.toBytes());
+  }
+
+  private void setupBaseline(String name) throws IOException {
+    Files.createDirectories(destinationRoot.resolve(name));
+    options.regenerateOptions.setRegenBaseline(name);
+  }
+
+  // need something in the origin when using an import baseline
+  private void setupFooOriginImport() throws IOException {
+    origin.singleFileChange(0, "foo description", "foo.txt", "foo");
+  }
+
+  private void setupTarget(String name) throws IOException {
+    Files.createDirectories(destinationRoot.resolve(name));
+    options.regenerateOptions.setRegenTarget(name);
+  }
+
+  @Test
+  public void testCallsUpdateChange() throws Exception {
+    setupFooOriginImport();
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    setupTarget("bar");
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            any(),
+            eq(Glob.ALL_FILES),
+            eq("bar"));
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testGeneratesPatches() throws Exception {
+    setupTarget("bar");
+
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            argThat(path -> Files.exists(path.resolve("AUTOPATCH").resolve(testfile + ".patch"))),
+            eq(Glob.ALL_FILES),
+            eq("bar"));
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testImportBaseline_noSourceRef_inferredBaseline_usesInferredBaseline()
+      throws Exception {
+    origin.singleFileChange(0, "foo description", "test.txt", "foo");
+
+    // infer the first change as the baseline
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    origin.singleFileChange(1, "bar description", "test.txt", "bar");
+
+    setupTarget("bar");
+    writeDestination("bar", "test.txt", "destinationbar");
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            argThat(
+                path -> {
+                  try {
+                    // patch is against the inferred reference
+                    assertThatPath(path)
+                        .containsFileMatching(
+                            "AUTOPATCH/test.txt.patch",
+                            Pattern.compile(".*-foo\n.*", Pattern.DOTALL));
+                  } catch (IOException e) {
+                    throw new RuntimeException(e);
+                  }
+                  return true;
+                }),
+            any(),
+            eq("bar"));
+  }
+
+  @Test
+  public void testImportBaseline_noSourceRef_noInferredBaseline_usesHead() throws Exception {
+    origin.singleFileChange(0, "foo description", "test.txt", "foo");
+    origin.singleFileChange(1, "bar description", "test.txt", "bar");
+
+    when(patchRegenerator.inferImportBaseline(any(), any())).thenReturn(Optional.empty());
+
+    setupTarget("bar");
+    writeDestination("bar", "test.txt", "destinationbar");
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            argThat(
+                path -> {
+                  try {
+                    // patch is against the latest reference
+                    assertThatPath(path)
+                        .containsFileMatching(
+                            "AUTOPATCH/test.txt.patch",
+                            Pattern.compile(".*-bar\n.*", Pattern.DOTALL));
+                  } catch (IOException e) {
+                    throw new RuntimeException(e);
+                  }
+                  return true;
+                }),
+            any(),
+            eq("bar"));
+  }
+
+  @Test
+  public void testImportBaseline_noSourceRef_noInferredBaseline_emitsWarning() throws Exception {
+    origin.singleFileChange(0, "foo description", "test.txt", "foo");
+
+    when(patchRegenerator.inferImportBaseline(any(), any())).thenReturn(Optional.empty());
+
+    setupTarget("bar");
+    writeDestination("bar", "test.txt", "destinationbar");
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    ((TestingConsole) options.general.console())
+        .assertThat()
+        .onceInLog(
+            MessageType.WARNING,
+            "Regenerate was unable to detect the import baseline reference nor was a reference"
+                + " passed in.*");
+  }
+
+  @Test
+  public void testImportBaseline_sourceRef_inferredBaseline_usesSourceRef() throws Exception {
+    origin.singleFileChange(0, "foo description", "test.txt", "foo");
+    String firstChangeRef = origin.getLatestChange().asString();
+
+    origin.singleFileChange(1, "bar description", "test.txt", "bar");
+    // infer the second change as the baseline
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    setupTarget("bar");
+    writeDestination("bar", "test.txt", "destinationbar");
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(
+            ImmutableList.of(
+                testRoot.resolve("copy.bara.sky").toString(), "default", firstChangeRef),
+            cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            argThat(
+                path -> {
+                  try {
+                    // patch is against the source reference
+                    assertThatPath(path)
+                        .containsFileMatching(
+                            "AUTOPATCH/test.txt.patch",
+                            Pattern.compile(".*-foo\n.*", Pattern.DOTALL));
+                  } catch (IOException e) {
+                    throw new RuntimeException(e);
+                  }
+                  return true;
+                }),
+            any(),
+            eq("bar"));
+  }
+
+  @Test
+  public void testRegenerate_noOptionTarget_inferredTarget_usesInferredTarget() throws Exception {
+    origin.singleFileChange(1, "foo change", "test.txt", "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    setupTarget("bar");
+
+    // clear target from options, only pass it in through infer
+    options.regenerateOptions.setRegenTarget(null);
+    when(patchRegenerator.inferRegenTarget()).thenReturn(Optional.of("bar"));
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    // should not throw
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    verify(patchRegenerator).updateChange(any(), any(), any(), eq("bar"));
+  }
+
+  @Test
+  public void testRegenerate_optionTarget_inferredTarget_usesOptionTarget() throws Exception {
+    origin.singleFileChange(1, "foo change", "test.txt", "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    setupTarget("bar");
+
+    when(patchRegenerator.inferRegenTarget()).thenReturn(Optional.of("infertarget"));
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    // should not throw
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    // target from options, not from infer
+    verify(patchRegenerator).updateChange(any(), any(), any(), eq("bar"));
+  }
+
+  @Test
+  public void testRegenerate_noOptionTarget_noInferredTarget_throws() throws Exception {
+    origin.singleFileChange(1, "foo change", "test.txt", "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    setupTarget("bar");
+    options.regenerateOptions.setRegenTarget(null);
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    Throwable t = assertThrows(ValidationException.class, () -> cmd.run(commandEnv));
+    assertThat(t)
+        .hasMessageThat()
+        .contains("Regen target was neither supplied nor able to be inferred.");
+  }
+
+  @Test
+  public void testRegenerate_generatesPatch() throws Exception {
+    setupTarget("bar");
+
+    String testfile = "asdf.txt";
+    // different contents should generate diff
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    writeDestination("bar", testfile, "bar");
+
+    options.regenerateOptions.setRegenImportBaseline(true);
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            argThat(path -> Files.exists(path.resolve("AUTOPATCH").resolve(testfile + ".patch"))),
+            eq(Glob.ALL_FILES),
+            eq("bar"));
+  }
+
+  @Test
+  public void testRegenerate_noSectionHeadersInPatch() throws Exception {
+    setupTarget("bar");
+    String testfile = "Test.java";
+    String originalContent =
+        """
+        public class Test {
+          public void foo() {
+            // 1
+            // 2
+            // 3
+            System.out.println("original");
+          }
+        }
+        """;
+    String modifiedContent =
+        """
+        public class Test {
+          public void foo() {
+            // 1
+            // 2
+            // 3
+            System.out.println("modified");
+          }
+        }
+        """;
+    String expectedDiff =
+        """
+        --- a/Test.java
+        +++ b/Test.java
+        @@ -3,6 +3,6 @@
+             // 1
+             // 2
+             // 3
+        -    System.out.println("original");
+        +    System.out.println("modified");
+           }
+         }
+        """;
+    origin.singleFileChange(0, "foo description", testfile, originalContent);
+    writeDestination("bar", testfile, modifiedContent);
+    options.regenerateOptions.setRegenImportBaseline(true);
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    RegenerateCmd cmd = getCmd(getNonMergeConsistencyFileConfigString());
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+    String expectedPatchPath = CONSISTENCY_FILE_PATH + ".patch";
+    Path patchFile = pathArg.getValue().resolve(expectedPatchPath);
+    assertThat(Files.exists(patchFile)).isTrue();
+    String patchContent = Files.readString(patchFile);
+    assertThat(patchContent).isEqualTo(expectedDiff);
+  }
+
+  @Test
+  public void testNoDiff_generatesNoPatches() throws Exception {
+    setupTarget("bar");
+
+    String testfile = "asdf.txt";
+    // same contents should generate no diff
+    origin.singleFileChange(0, "foo description", testfile, "bar");
+    writeDestination("bar", testfile, "bar");
+
+    options.regenerateOptions.setRegenImportBaseline(true);
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    // check that no patches were generated
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            argThat(path -> !Files.exists(path.resolve("AUTOPATCH").resolve(testfile + ".patch"))),
+            eq(Glob.ALL_FILES),
+            eq("bar"));
+  }
+
+  @Test
+  public void testConsistencyFile_generatesFile() throws Exception {
+    setupBaseline("foo");
+    setupTarget("bar");
+
+    String testfile = "asdf.txt";
+    writeDestination("foo", testfile, "foo");
+    writeDestination("bar", testfile, "bar");
+
+    setupBaselineConsistencyFile("foo", "foo");
+    RegenerateCmd cmd = getCmd(getConsistencyFileConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            pathArg.capture(),
+            eq(Glob.ALL_FILES),
+            eq("bar"));
+    assertThatPath(pathArg.getValue()).containsFiles(CONSISTENCY_FILE_PATH);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testConsistencyFile_generatesFile_nonMerge() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+    RegenerateCmd cmd = getCmd(getNonMergeConsistencyFileConfigString());
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+    assertThatPath(pathArg.getValue()).containsFiles(CONSISTENCY_FILE_PATH);
+
+    // Check that consistency file was written without the diff
+    Path consistencyFile = pathArg.getValue().resolve(CONSISTENCY_FILE_PATH);
+    ConsistencyFile parsedCf = ConsistencyFile.fromBytes(Files.readAllBytes(consistencyFile));
+    assertThat(parsedCf.getDiffContent()).isEmpty();
+
+    // Check that the default patch file was written and contains the diff
+    String expectedPatchPath = "test/test.bara.consistency.patch";
+    assertThatPath(pathArg.getValue()).containsFiles(expectedPatchPath);
+    String patchContent = Files.readString(pathArg.getValue().resolve(expectedPatchPath));
+    assertThat(patchContent).contains("asdf.txt");
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testConsistencyFile_generatesFile_nonMerge_explicitPatch() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+
+    String explicitPatchPath = "test/patches/local.patch";
+    RegenerateCmd cmd =
+        getCmd(
+            getNonMergeConsistencyFileConfigWithExplicitPatchString(
+                CONSISTENCY_FILE_PATH, explicitPatchPath));
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+
+    // Check consistency file has no diff
+    Path consistencyFile = pathArg.getValue().resolve(CONSISTENCY_FILE_PATH);
+    ConsistencyFile parsedCf = ConsistencyFile.fromBytes(Files.readAllBytes(consistencyFile));
+    assertThat(parsedCf.getDiffContent()).isEmpty();
+
+    // Check explicit patch file exists and contains diff
+    assertThatPath(pathArg.getValue()).containsFiles(explicitPatchPath);
+    String patchContent = Files.readString(pathArg.getValue().resolve(explicitPatchPath));
+    assertThat(patchContent).contains("asdf.txt");
+
+    // Check series file was created and contains local.patch
+    String expectedSeriesPath = "test/patches/series";
+    assertThatPath(pathArg.getValue()).containsFiles(expectedSeriesPath);
+    String seriesContent = Files.readString(pathArg.getValue().resolve(expectedSeriesPath));
+    assertThat(seriesContent.trim()).isEqualTo("local.patch");
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testConsistencyFile_preexistingExplicitPatch_noDiff_deletes() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    String explicitPatchPath = "test/patches/local.patch";
+    String seriesPath = "test/patches/series";
+    // Setup existing patch and series files in destination
+    writeDestination("bar", explicitPatchPath, "existing patch content");
+    writeDestination("bar", seriesPath, "local.patch\n");
+    // Same contents in origin and destination -> no diff
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "foo");
+
+    RegenerateCmd cmd =
+        getCmd(
+            getNonMergeConsistencyFileConfigWithExplicitPatchString(
+                CONSISTENCY_FILE_PATH, explicitPatchPath));
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    ArgumentCaptor<Glob> globArg = ArgumentCaptor.forClass(Glob.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), globArg.capture(), eq("bar"));
+    // Check patch file does NOT exist in nextPath (meaning it should be deleted)
+    assertThatPath(pathArg.getValue()).containsNoFiles(explicitPatchPath);
+    // Check patch file IS registered in destinationFiles (globArg) so it gets deleted
+    PathMatcher destPathMatcher = globArg.getValue().relativeTo(pathArg.getValue());
+    assertThat(destPathMatcher.matches(pathArg.getValue().resolve(explicitPatchPath))).isTrue();
+    // Check series file is empty
+    assertThatPath(pathArg.getValue()).containsFiles(seriesPath);
+    String seriesContent = Files.readString(pathArg.getValue().resolve(seriesPath));
+    assertThat(seriesContent.trim()).isEmpty();
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testConsistencyFile_generatesFile_nonMerge_explicitPatch_stripsPrefix()
+      throws Exception {
+    setupTarget("foo/bar");
+    String testfile = "foo/bar/asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("foo/bar", "foo/bar/asdf.txt", "bar");
+
+    String explicitPatchPath = "test/patches/local.patch";
+    RegenerateCmd cmd =
+        getCmd(
+            getNonMergeConsistencyFileConfigWithExplicitPatchAndPrefixToStripString(
+                "foo/bar/" + CONSISTENCY_FILE_PATH, explicitPatchPath, "foo/bar"));
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator)
+        .updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("foo/bar"));
+
+    // Check explicit patch file exists and contains diff relative to bar
+    assertThatPath(pathArg.getValue()).containsFiles(explicitPatchPath);
+    String patchContent = Files.readString(pathArg.getValue().resolve(explicitPatchPath));
+    assertThat(patchContent).contains("--- a/asdf.txt");
+    assertThat(patchContent).contains("+++ b/asdf.txt");
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testConsistencyFile_commandLineOverride() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+
+    // Pass cmd line args to set patch file explicitly
+    options.regenerateOptions.setRegenPatchFile("test/patches/command_line.patch");
+
+    RegenerateCmd cmd = getCmd(getNonMergeConsistencyFileConfigString());
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+
+    // Check explicit CMD patch file exists and contains diff
+    String explicitCmdPatchPath = "test/patches/command_line.patch";
+    assertThatPath(pathArg.getValue()).containsFiles(explicitCmdPatchPath);
+    String patchContent = Files.readString(pathArg.getValue().resolve(explicitCmdPatchPath));
+    assertThat(patchContent).contains("asdf.txt");
+
+    // Check series file has command_line.patch
+    String expectedSeriesPath = "test/patches/series";
+    assertThatPath(pathArg.getValue()).containsFiles(expectedSeriesPath);
+    String seriesContent = Files.readString(pathArg.getValue().resolve(expectedSeriesPath));
+    assertThat(seriesContent.trim()).isEqualTo("command_line.patch");
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testConsistencyFile_defaultDescriptionFromConfig() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+    String config =
+        getNonMergeConsistencyFileConfigWithExplicitPatchAndDescriptionString(
+            "do-not-edit.bara.consistency",
+            "test/patches/explicit.patch",
+            "Default description\nLine 2");
+    RegenerateCmd cmd = getCmd(config);
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+    String explicitPatchPath = "test/patches/explicit.patch";
+    assertThatPath(pathArg.getValue()).containsFiles(explicitPatchPath);
+    String patchContent = Files.readString(pathArg.getValue().resolve(explicitPatchPath));
+    assertThat(patchContent).startsWith("Default description\nLine 2\n--- ");
+  }
+
+  @Test
+  public void testConsistencyFile_cliDescriptionOverride() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+    options.regenerateOptions.setRegenPatchDescription("CLI Override Description");
+    String config =
+        getNonMergeConsistencyFileConfigWithExplicitPatchAndDescriptionString(
+            "do-not-edit.bara.consistency", "test/patches/explicit.patch", "Default description");
+    RegenerateCmd cmd = getCmd(config);
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+    String explicitPatchPath = "test/patches/explicit.patch";
+    String patchContent = Files.readString(pathArg.getValue().resolve(explicitPatchPath));
+    assertThat(patchContent).startsWith("CLI Override Description\n--- ");
+  }
+
+  @Test
+  public void testConsistencyFile_defaultToNoKeepDescription() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+    writeDestination(
+        "bar",
+        "test/patches/explicit.patch",
+        "Existing Description\n--- a/asdf.txt\n+++ b/asdf.txt\n");
+    String config =
+        getNonMergeConsistencyFileConfigWithExplicitPatchAndDescriptionString(
+            "do-not-edit.bara.consistency", "test/patches/explicit.patch", "Config description");
+    RegenerateCmd cmd = getCmd(config);
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+    String explicitPatchPath = "test/patches/explicit.patch";
+    String patchContent = Files.readString(pathArg.getValue().resolve(explicitPatchPath));
+    assertThat(patchContent).startsWith("Config description\n--- ");
+  }
+
+  @Test
+  public void testConsistencyFile_defaultToKeepDescriptionWithExplicitPatchFile() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+    writeDestination(
+        "bar",
+        "test/patches/explicit_cli.patch",
+        "Existing Description\n--- a/asdf.txt\n+++ b/asdf.txt\n");
+    options.regenerateOptions.setRegenPatchFile("test/patches/explicit_cli.patch");
+    String config =
+        getNonMergeConsistencyFileConfigWithExplicitPatchAndDescriptionString(
+            "do-not-edit.bara.consistency", "test/patches/explicit.patch", "Config description");
+    RegenerateCmd cmd = getCmd(config);
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+    String explicitPatchPath = "test/patches/explicit_cli.patch";
+    String patchContent = Files.readString(pathArg.getValue().resolve(explicitPatchPath));
+    assertThat(patchContent).startsWith("Existing Description\n--- ");
+  }
+
+  @Test
+  public void testConsistencyFile_keepDescriptionFalse_fallsBackToConfig() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+    writeDestination(
+        "bar",
+        "test/patches/explicit.patch",
+        "Existing Description\n--- a/asdf.txt\n+++ b/asdf.txt\n");
+    options.regenerateOptions.setRegenPatchDescriptionKeep(false);
+    String config =
+        getNonMergeConsistencyFileConfigWithExplicitPatchAndDescriptionString(
+            "do-not-edit.bara.consistency", "test/patches/explicit.patch", "Config Description");
+    RegenerateCmd cmd = getCmd(config);
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+    String explicitPatchPath = "test/patches/explicit.patch";
+    String patchContent = Files.readString(pathArg.getValue().resolve(explicitPatchPath));
+    assertThat(patchContent).startsWith("Config Description\n--- ");
+  }
+
+  @Test
+  public void testConsistencyFile_keepDescriptionFalseOverrideWithExplicitPatchFile()
+      throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+    writeDestination(
+        "bar",
+        "test/patches/explicit_cli.patch",
+        "Existing Description\n--- a/asdf.txt\n+++ b/asdf.txt\n");
+    options.regenerateOptions.setRegenPatchFile("test/patches/explicit_cli.patch");
+    options.regenerateOptions.setRegenPatchDescriptionKeep(false);
+    String config =
+        getNonMergeConsistencyFileConfigWithExplicitPatchAndDescriptionString(
+            "do-not-edit.bara.consistency", "test/patches/explicit.patch", "Config Description");
+    RegenerateCmd cmd = getCmd(config);
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+    String explicitPatchPath = "test/patches/explicit_cli.patch";
+    String patchContent = Files.readString(pathArg.getValue().resolve(explicitPatchPath));
+    assertThat(patchContent).startsWith("Config Description\n--- ");
+  }
+
+  @Test
+  public void testConsistencyFile_keepDescriptionTrueOverrideWithoutExplicitPatchFile()
+      throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+    writeDestination(
+        "bar",
+        "test/patches/explicit.patch",
+        "Existing Description\n--- a/asdf.txt\n+++ b/asdf.txt\n");
+    options.regenerateOptions.setRegenPatchDescriptionKeep(true);
+    String config =
+        getNonMergeConsistencyFileConfigWithExplicitPatchAndDescriptionString(
+            "do-not-edit.bara.consistency", "test/patches/explicit.patch", "Config Description");
+    RegenerateCmd cmd = getCmd(config);
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+    String explicitPatchPath = "test/patches/explicit.patch";
+    String patchContent = Files.readString(pathArg.getValue().resolve(explicitPatchPath));
+    assertThat(patchContent).startsWith("Existing Description\n--- ");
+  }
+
+  @Test
+  public void testConsistencyFile_invalidDescriptionFromCli_throws() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+    options.regenerateOptions.setRegenPatchDescription("Invalid Description\n--- a/file.txt");
+    RegenerateCmd cmd = getCmd(getNonMergeConsistencyFileConfigString());
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    assertThrows(ValidationException.class, () -> cmd.run(commandEnv));
+  }
+
+  @Test
+  public void testConsistencyFile_capturesDiff() throws Exception {
+    setupBaseline("foo");
+    setupTarget("bar");
+
+    String testfile = "asdf.txt";
+    writeDestination("foo", testfile, "foo");
+    writeDestination("bar", testfile, "bar");
+
+    setupBaselineConsistencyFile("foo", "foo");
+
+    RegenerateCmd cmd = getCmd(getConsistencyFileConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            pathArg.capture(),
+            eq(Glob.ALL_FILES),
+            eq("bar"));
+
+    ConsistencyFile consistencyFile =
+        ConsistencyFile.fromBytes(
+            Files.readAllBytes(pathArg.getValue().resolve(CONSISTENCY_FILE_PATH)));
+
+    assertThat(Files.readString(destinationPath("bar").resolve(testfile))).isEqualTo("bar");
+    consistencyFile.reversePatches(destinationPath("bar"), env);
+    assertThat(Files.readString(destinationPath("bar").resolve(testfile))).isEqualTo("foo");
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  // test existing consistency file is used to generate new patch
+  @Test
+  public void testConsistencyFile_usesConsistencyFileBaseline() throws Exception {
+    // generate a ConsistencyFile, make a new edit, use the directory
+    // with the generated patch as baseline to regenerate again
+    setupPristineBaseline("foofoo");
+    setupBaseline("foo");
+    setupTarget("bar");
+
+    String testfile = "asdf.txt";
+    writeDestination("foo", testfile, "foo");
+    writeDestination("foofoo", testfile, "foofoo");
+    writeDestination("bar", testfile, "bar");
+
+    setupBaselineConsistencyFile("foofoo", "foo");
+
+    RegenerateCmd cmd = getCmd(getConsistencyFileConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            pathArg.capture(),
+            eq(Glob.ALL_FILES),
+            eq("bar"));
+    assertThatPath(pathArg.getValue()).containsFile(testfile, "bar");
+    assertThatPath(pathArg.getValue()).containsFiles(CONSISTENCY_FILE_PATH);
+
+    // setup second run
+    setupBaseline("bar");
+    setupTarget("foobar");
+
+    // the directory uploaded from the previous run is the new baseline state
+    clearDir(destinationPath("bar"));
+    FileUtil.copyFilesRecursively(
+        pathArg.getValue(), destinationPath("bar"), CopySymlinkStrategy.FAIL_OUTSIDE_SYMLINKS);
+    writeDestination("foobar", testfile, "foobar");
+
+    commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    clearDir(workdir);
+    exitCode = cmd.run(commandEnv);
+    verify(patchRegenerator)
+        .updateChange(
+            any(),
+            pathArg.capture(),
+            eq(Glob.ALL_FILES),
+            eq("foobar"));
+
+    assertThatPath(pathArg.getValue()).containsFile(testfile, "foobar");
+    assertThatPath(pathArg.getValue()).containsFiles(CONSISTENCY_FILE_PATH);
+
+    ConsistencyFile consistencyFile =
+        ConsistencyFile.fromBytes(
+            Files.readAllBytes(pathArg.getValue().resolve(CONSISTENCY_FILE_PATH)));
+    consistencyFile.reversePatches(pathArg.getValue(), env);
+
+    // reversing the diff should result in the pristine import
+    assertThatPath(pathArg.getValue()).containsFile(testfile, "foofoo");
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testConsistencyFile_optionBaseline_inferredBaseline_usesOptionBaseline()
+      throws Exception {
+    setupPristineBaseline("pristine");
+    setupBaseline("foo");
+    setupBaseline("baseline");
+    setupTarget("target");
+
+    when(patchRegenerator.inferRegenBaseline()).thenReturn(Optional.of("foo"));
+
+    writeDestination("pristine", "test.txt", "original");
+    writeDestination("baseline", "test.txt", "oldpatch");
+    writeDestination("foo", "test.txt", "badpatch");
+    writeDestination("target", "test.txt", "newpatch");
+
+    // after we run, we will check that the restored baseline is from the pristine directory
+    // and not foo
+    setupBaselineConsistencyFile("pristine", "baseline");
+    setupBaselineConsistencyFile("foo", "foo");
+
+    RegenerateCmd cmd = getCmd(getConsistencyFileConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator)
+        .updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("target"));
+
+    assertThatPath(pathArg.getValue()).containsFile("test.txt", "newpatch");
+    assertThatPath(pathArg.getValue()).containsFiles(CONSISTENCY_FILE_PATH);
+
+    ConsistencyFile consistencyFile =
+        ConsistencyFile.fromBytes(
+            Files.readAllBytes(pathArg.getValue().resolve(CONSISTENCY_FILE_PATH)));
+    consistencyFile.reversePatches(pathArg.getValue(), env);
+
+    // reversing the diff should result in the pristine baseline, not the foo one
+    assertThatPath(pathArg.getValue()).containsFile("test.txt", "original");
+  }
+
+  @Test
+  public void testConsistencyFile_noOptionBaseline_inferredBaseline_usesInferredBaseline()
+      throws Exception {
+    setupPristineBaseline("pristine");
+    setupBaseline("foo");
+    setupBaseline("baseline");
+    options.regenerateOptions.setRegenBaseline(null);
+    setupTarget("target");
+
+    when(patchRegenerator.inferRegenBaseline()).thenReturn(Optional.of("baseline"));
+
+    writeDestination("pristine", "test.txt", "original");
+    writeDestination("baseline", "test.txt", "oldpatch");
+    writeDestination("foo", "test.txt", "badpatch");
+    writeDestination("target", "test.txt", "newpatch");
+
+    // after we run, we will check that the restored baseline is from the pristine directory
+    // and not foo
+    setupBaselineConsistencyFile("pristine", "baseline");
+    setupBaselineConsistencyFile("foo", "foo");
+
+    RegenerateCmd cmd = getCmd(getConsistencyFileConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator)
+        .updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("target"));
+
+    assertThatPath(pathArg.getValue()).containsFile("test.txt", "newpatch");
+    assertThatPath(pathArg.getValue()).containsFiles(CONSISTENCY_FILE_PATH);
+
+    ConsistencyFile consistencyFile =
+        ConsistencyFile.fromBytes(
+            Files.readAllBytes(pathArg.getValue().resolve(CONSISTENCY_FILE_PATH)));
+    consistencyFile.reversePatches(pathArg.getValue(), env);
+
+    // reversing the diff should result in the pristine baseline, not the foo one
+    assertThatPath(pathArg.getValue()).containsFile("test.txt", "original");
+  }
+
+  @Test
+  public void testConsistencyFile_noOptionBaseline_noInferredBaseline_usesImportBaseline()
+      throws Exception {
+    origin.singleFileChange(0, "foo description", "test.txt", "foo");
+
+    // no option baseline
+    options.regenerateOptions.setRegenBaseline(null);
+    // no inferred baseline
+    when(patchRegenerator.inferRegenBaseline()).thenReturn(Optional.empty());
+    // setup origin change as inferred import baseline
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    setupTarget("target");
+
+    // current destination contents are altered from the import
+    writeDestination("target", "test.txt", "newpatch");
+
+    RegenerateCmd cmd = getCmd(getConsistencyFileConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator)
+        .updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("target"));
+
+    assertThatPath(pathArg.getValue()).containsFile("test.txt", "newpatch");
+    assertThatPath(pathArg.getValue()).containsFiles(CONSISTENCY_FILE_PATH);
+
+    ConsistencyFile consistencyFile =
+        ConsistencyFile.fromBytes(
+            Files.readAllBytes(pathArg.getValue().resolve(CONSISTENCY_FILE_PATH)));
+    consistencyFile.reversePatches(pathArg.getValue(), env);
+
+    // reversing the diff should result in the origin import (no transformations)
+    assertThatPath(pathArg.getValue()).containsFile("test.txt", "foo");
+  }
+
+  /*
+   * when import baseline is used on consistency file projects, don't generate patches against the
+   * consistency file
+   */
+  @Test
+  public void
+      testConsistencyFile_noOptionBaseline_noInferredBaseline_usesImportBaseline_excludesConsistencyFile()
+          throws Exception {
+    origin.singleFileChange(0, "foo description", "test.txt", "foo");
+
+    // no option baseline
+    options.regenerateOptions.setRegenBaseline(null);
+    // no inferred baseline
+    when(patchRegenerator.inferRegenBaseline()).thenReturn(Optional.empty());
+    // setup origin change as inferred import baseline
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    setupTarget("target");
+
+    // set up a destination that has a consistency file
+    writeDestination("target-pristine", "test.txt", "newContents");
+    writeDestination("target", "test.txt", "newContents-patched");
+    setupBaselineConsistencyFile("target-pristine", "target");
+
+    RegenerateCmd cmd = getCmd(getConsistencyFileConfigString());
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator)
+        .updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("target"));
+
+    assertThatPath(pathArg.getValue()).containsFile("test.txt", "newContents-patched");
+    assertThatPath(pathArg.getValue()).containsFiles(CONSISTENCY_FILE_PATH);
+
+    ConsistencyFile consistencyFile =
+        ConsistencyFile.fromBytes(
+            Files.readAllBytes(pathArg.getValue().resolve(CONSISTENCY_FILE_PATH)));
+    consistencyFile.reversePatches(pathArg.getValue(), env);
+
+    // reversing the diff should leave the consistency file as-is
+    // (the diff should not include a patch that generates the consistency file)
+    assertThatPath(pathArg.getValue()).containsFiles(CONSISTENCY_FILE_PATH);
+  }
+
+  private CommandEnv prepAndGetCommandEnv(ImmutableList<String> args, RegenerateCmd cmd)
+      throws Exception {
+    CommandEnv commandEnv = new CommandEnv(workdir, options.build(), args);
+    commandEnv.parseConfigFileArgs(cmd, true);
+    return commandEnv;
+  }
+
+  private RegenerateCmd getCmd(String configString) {
+    ModuleSet moduleSet = skylark.createModuleSet();
+    return new RegenerateCmd(
+        ((configPath, sourceRef) ->
+            new ConfigLoader(
+                moduleSet,
+                skylark.createConfigFile("copy.bara.sky", configString),
+                options.general.getStarlarkMode()) {
+              @Override
+              protected Config doLoadForRevision(Console console, Revision revision)
+                  throws ValidationException {
+                try {
+                  return skylark.loadConfig(configPath);
+                } catch (IOException e) {
+                  throw new RuntimeException(e);
+                }
+              }
+            }));
+  }
+
+  private String getImportAutopatchesConfigString() {
+    return """
+    core.workflow(
+        name = 'default',
+        origin = testing.origin(),
+        origin_files = glob(['**']),
+        destination = testing.destination(),
+        mode = 'SQUASH',
+        authoring = authoring.pass_thru('example <example@example.com>'),
+        merge_import = core.merge_import_config(
+          package_path = ""
+        ),
+        autopatch_config = core.autopatch_config(
+          header = '# header',
+          directory_prefix = '',
+          directory = 'AUTOPATCH',
+          suffix = '.patch'
+        ),
+    )\
+    """;
+  }
+
+  private String getConsistencyFileConfigString() {
+    return """
+    core.workflow(
+        name = 'default',
+        origin = testing.origin(),
+        origin_files = glob(['**']),
+        destination = testing.destination(),
+        mode = 'SQUASH',
+        authoring = authoring.pass_thru('example <example@example.com>'),
+        merge_import = core.merge_import_config(
+          package_path = "",
+          use_consistency_file = True
+        ),
+        consistency_file_path = "%s",
+        autopatch_config = core.autopatch_config(
+          header = '# header',
+          directory_prefix = '',
+          directory = 'AUTOPATCH',
+          suffix = '.patch'
+        ),
+    )\
+    """
+        .formatted(CONSISTENCY_FILE_PATH);
+  }
+
+  private String getNonMergeConsistencyFileConfigString() {
+    return """
+    core.workflow(
+        name = 'default',
+        origin = testing.origin(),
+        origin_files = glob(['**']),
+        destination = testing.destination(),
+        mode = 'SQUASH',
+        authoring = authoring.pass_thru('example <example@example.com>'),
+        consistency_file_path = "%s",
+        autopatch_config = core.autopatch_config(
+          header = '# header',
+          directory_prefix = '',
+          directory = 'AUTOPATCH',
+          suffix = '.patch'
+        ),
+    )\
+    """
+        .formatted(CONSISTENCY_FILE_PATH);
+  }
+
+  private String getNonMergeConsistencyFileConfigWithExplicitPatchString(
+      String consistencyPath, String patchPath) {
+    return """
+    core.workflow(
+        name = 'default',
+        origin = testing.origin(),
+        origin_files = glob(['**']),
+        destination = testing.destination(),
+        mode = 'SQUASH',
+        authoring = authoring.pass_thru('example <example@example.com>'),
+        consistency_file = core.consistency_file_config(
+            path = "%s",
+            patch_file_path = "%s"
+        ),
+    )\
+    """
+        .formatted(consistencyPath, patchPath);
+  }
+
+  private String getNonMergeConsistencyFileConfigWithExplicitPatchAndPrefixToStripString(
+      String consistencyPath, String patchPath, String prefixToStrip) {
+    return """
+    core.workflow(
+        name = 'default',
+        origin = testing.origin(),
+        origin_files = glob(['**']),
+        destination = testing.destination(),
+        mode = 'SQUASH',
+        authoring = authoring.pass_thru('example <example@example.com>'),
+        consistency_file = core.consistency_file_config(
+            path = "%s",
+            patch_file_path = "%s",
+            patch_path_prefix_to_strip = "%s"
+        ),
+    )\
+    """
+        .formatted(consistencyPath, patchPath, prefixToStrip);
+  }
+
+  private void clearDir(Path dir) throws IOException {
+    FileUtil.deleteRecursively(dir);
+    Files.createDirectories(dir);
+  }
+
+  private void writeDestination(String name, String filepath, String contents) throws IOException {
+    Path writePath = destinationRoot.resolve(name).resolve(filepath);
+    Files.createDirectories(writePath.getParent());
+    Files.writeString(writePath, contents);
+  }
+
+  private void writeDestination(String name, String filepath, byte[] bytes) throws IOException {
+    Path writePath = destinationRoot.resolve(name).resolve(filepath);
+    Files.createDirectories(writePath.getParent());
+    Files.write(writePath, bytes);
+  }
+
+  private Path destinationPath(String name) {
+    return destinationRoot.resolve(name);
+  }
+
+
+  @Test
+  public void testAbsoluteConfigPathTruncation() throws Exception {
+    Path root = tempFolder.newFolder("root").toPath();
+    Path configPath = root.resolve("subdir/copy.bara.sky");
+    assertThat(configPath.isAbsolute()).isTrue();
+    Files.createDirectories(configPath.getParent());
+
+    Files.writeString(configPath, getConsistencyFileConfigString());
+
+    ConfigFile configFile = new PathBasedConfigFile(configPath, root, /* identifierPrefix= */ null);
+
+    // Setup an origin change
+    setupFooOriginImport();
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    setupTarget("bar");
+    writeDestination("bar", "foo.txt", "bar");
+
+    // Prepare baseline consistency file (pristine vs baseline)
+    setupPristineBaseline("pristine");
+    writeDestination("pristine", "foo.txt", "foo");
+    setupBaseline("baseline");
+    writeDestination("baseline", "foo.txt", "foo");
+    setupBaselineConsistencyFile("pristine", "baseline");
+
+    RegenerateCmd cmd =
+        new RegenerateCmd(
+            (path, sourceRef) ->
+                new ConfigLoader(
+                    skylark.createModuleSet(), configFile, options.general.getStarlarkMode()) {
+                  @Override
+                  protected Config doLoadForRevision(Console console, Revision revision)
+                      throws ValidationException {
+                    try {
+                      return skylark.loadConfig(path);
+                    } catch (IOException e) {
+                      throw new RuntimeException(e);
+                    }
+                  }
+                });
+
+    CommandEnv commandEnv = prepAndGetCommandEnv(ImmutableList.of(configPath.toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), any(), eq("bar"));
+
+    // Verify consistency file content starts with the relative path
+    String consistencyFile = Files.readString(pathArg.getValue().resolve(CONSISTENCY_FILE_PATH));
+    assertThat(consistencyFile).contains("# Workflow: subdir/copy.bara.sky:default");
+  }
+
+  @Test
+  public void testConsistencyFile_excludeBuildFiles() throws Exception {
+    setupTarget("bar");
+
+    String testfile = "asdf.txt";
+    String buildfile = "BUILD";
+    writeDestination("bar", testfile, "bar");
+    writeDestination("bar", buildfile, "java_library(name = 'foo')");
+
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    String config =
+        """
+        core.workflow(
+            name = 'default',
+            origin = testing.origin(),
+            origin_files = glob(['**']),
+            destination = testing.destination(),
+            mode = 'SQUASH',
+            authoring = authoring.pass_thru('example <example@example.com>'),
+            consistency_file = core.consistency_file_config(
+                path = "%s",
+                exclude_build_files = True
+            ),
+        )\
+        """
+            .formatted(CONSISTENCY_FILE_PATH);
+
+    RegenerateCmd cmd = getCmd(config);
+
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+
+    Path consistencyFilePath = pathArg.getValue().resolve(CONSISTENCY_FILE_PATH);
+    assertThatPath(pathArg.getValue()).containsFiles(CONSISTENCY_FILE_PATH);
+
+    String consistencyFileContent = Files.readString(consistencyFilePath);
+    assertThat(consistencyFileContent).contains("asdf.txt");
+    assertThat(consistencyFileContent).doesNotContain("BUILD");
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testRegenerate_disablesQuiltPatchRefresh() throws Exception {
+    setupFooOriginImport();
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    setupTarget("bar");
+    RegenerateCmd cmd = getCmd(getImportAutopatchesConfigString());
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+    assertThat(options.patch.quiltRefreshPatches).isFalse();
+  }
+
+  private String getConfigWithPatchTransformation(String consistencyPath, String patchPath) {
+    return """
+    core.workflow(
+        name = 'default',
+        origin = testing.origin(),
+        origin_files = glob(['**']),
+        destination = testing.destination(),
+        mode = 'SQUASH',
+        authoring = authoring.pass_thru('example <example@example.com>'),
+        consistency_file = core.consistency_file_config(
+            path = "%s",
+            patch_file_path = "%s"
+        ),
+        transformations = [
+            patch.apply(
+                patches = ["%s"],
+            )
+        ]
+    )\
+    """
+        .formatted(consistencyPath, patchPath, patchPath);
+  }
+
+  @Test
+  public void testConsistencyFile_preexistingPatchIsExcludedAndRegenerated() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    // Baseline origin has "origin content\n"
+    origin.singleFileChange(0, "foo description", testfile, "origin content\n");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+
+    // Custom patch file containing preexisting diff
+    String patchPath = "test/test.patch";
+    String preexistingDiff =
+        """
+        --- asdf.txt
+        +++ asdf.txt
+        @@ -1 +1,2 @@
+         origin content
+        +patch content
+        """;
+    writeDestination("bar", patchPath, preexistingDiff);
+    writeDestination("bar", "test/series", "test.patch\n");
+    skylark.addConfigFile(patchPath, preexistingDiff);
+
+    // Destination has: original content + preexisting patch content + new manual edit
+    writeDestination("bar", testfile, "origin content\npatch content\nnew manual content\n");
+
+    // Config with patch transformation
+    RegenerateCmd cmd = getCmd(getConfigWithPatchTransformation(CONSISTENCY_FILE_PATH, patchPath));
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+
+    // Check that consistency file has no diff
+    Path consistencyFile = pathArg.getValue().resolve(CONSISTENCY_FILE_PATH);
+    ConsistencyFile parsedCf = ConsistencyFile.fromBytes(Files.readAllBytes(consistencyFile));
+    assertThat(parsedCf.getDiffContent()).isEmpty();
+
+    // Check that the patch file was updated/regenerated with the combined diff (preexisting + new
+    // changes)
+    String patchContent = Files.readString(pathArg.getValue().resolve(patchPath));
+    assertThat(patchContent).contains("+patch content");
+    assertThat(patchContent).contains("+new manual content");
+
+    // Check that the patch file itself is NOT part of the diff (it was excluded from comparison)
+    assertThat(patchContent).doesNotContain("test.patch");
+
+    // Check that consistency file hashes include both generated patch and series file
+    assertThat(parsedCf.getFileHashes()).containsKey(patchPath);
+    assertThat(parsedCf.getFileHashes()).containsKey("test/series");
+
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+  }
+
+  @Test
+  public void testRegenerate_nonMergeMode_noAutopatchesGenerated() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+
+    RegenerateCmd cmd = getCmd(getNonMergeConsistencyFileConfigString());
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+
+    // Autopatches directory should not exist / contain files when merge_import is off
+    Path autopatchDir = pathArg.getValue().resolve("AUTOPATCH");
+    assertThat(Files.exists(autopatchDir)).isFalse();
+  }
+
+  @Test
+  public void testRegenerate_mergeMode_autopatchesAreGenerated() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+
+    RegenerateCmd cmd = getCmd(getConsistencyFileConfigString());
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), eq(Glob.ALL_FILES), eq("bar"));
+
+    // Autopatches directory should exist and contain the patch file when merge_import is on
+    Path autopatchDir = pathArg.getValue().resolve("AUTOPATCH");
+    assertThat(Files.exists(autopatchDir)).isTrue();
+    assertThatPath(pathArg.getValue()).containsFiles("AUTOPATCH/asdf.txt.patch");
+  }
+
+  @Test
+  public void testRegenerate_excludesGlobalMetadataFilesFromPatchDiff() throws Exception {
+    setupTarget("bar");
+    String testfile = "asdf.txt";
+    origin.singleFileChange(0, "foo description", testfile, "foo");
+    when(patchRegenerator.inferImportBaseline(any(), any()))
+        .thenReturn(Optional.of(origin.getLatestChange().asString()));
+    writeDestination("bar", testfile, "bar");
+
+    // Pre-exist some patch files in the destination
+    writeDestination("bar", "test/patches/other.patch", "preexisting patch content");
+    writeDestination("bar", "test/patches/series", "other.patch");
+
+    // Pass cmd line args to set patch file explicitly
+    options.regenerateOptions.setRegenPatchFile("test/patches/command_line.patch");
+
+    String config =
+        """
+        core.workflow(
+            name = 'default',
+            origin = testing.origin(),
+            origin_files = glob(['**']),
+            destination = testing.destination(),
+            destination_files = glob(['**'], exclude = ['test/patches/other.patch', 'test/patches/series']),
+            mode = 'SQUASH',
+            authoring = authoring.pass_thru('example <example@example.com>'),
+            consistency_file_path = "%s",
+            autopatch_config = core.autopatch_config(
+              header = '# header',
+              directory_prefix = '',
+              directory = 'AUTOPATCH',
+              suffix = '.patch'
+            ),
+        )
+        """
+            .formatted(CONSISTENCY_FILE_PATH);
+
+    RegenerateCmd cmd = getCmd(config);
+    CommandEnv commandEnv =
+        prepAndGetCommandEnv(ImmutableList.of(testRoot.resolve("copy.bara.sky").toString()), cmd);
+
+    ExitCode exitCode = cmd.run(commandEnv);
+    assertThat(exitCode).isEqualTo(ExitCode.SUCCESS);
+
+    ArgumentCaptor<Path> pathArg = ArgumentCaptor.forClass(Path.class);
+    verify(patchRegenerator).updateChange(any(), pathArg.capture(), any(), eq("bar"));
+
+    String patchContent =
+        Files.readString(pathArg.getValue().resolve("test/patches/command_line.patch"));
+    // The patch content should only contain the change to asdf.txt, not other.patch or series
+    assertThat(patchContent).contains("asdf.txt");
+    assertThat(patchContent).doesNotContain("other.patch");
+    assertThat(patchContent).doesNotContain("series");
+  }
+
+  private String getNonMergeConsistencyFileConfigWithExplicitPatchAndDescriptionString(
+      String consistencyPath, String patchPath, String description) {
+    return """
+    core.workflow(
+        name = 'default',
+        origin = testing.origin(),
+        origin_files = glob(['**']),
+        destination = testing.destination(),
+        mode = 'SQUASH',
+        authoring = authoring.pass_thru('example <example@example.com>'),
+        consistency_file = core.consistency_file_config(
+            path = "%s",
+            patch_file_path = "%s",
+            patch_file_description = \"\"\"%s\"\"\"
+        ),
+    )\\
+    """
+        .formatted(consistencyPath, patchPath, description);
+  }
+}

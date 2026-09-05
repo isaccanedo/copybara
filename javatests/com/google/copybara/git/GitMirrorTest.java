@@ -1,0 +1,1298 @@
+/*
+ * Copyright (C) 2016 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.google.copybara.git;
+
+import static com.google.common.truth.Truth.assertThat;
+import static com.google.copybara.git.GitRepository.newBareRepo;
+import static com.google.copybara.testing.git.GitTestUtil.getGitEnv;
+import static com.google.copybara.util.CommandRunner.DEFAULT_TIMEOUT;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.testing.FakeTicker;
+import com.google.copybara.config.Migration;
+import com.google.copybara.exception.RepoException;
+import com.google.copybara.exception.ValidationException;
+import com.google.copybara.git.GitCredential.UserPassword;
+import com.google.copybara.git.GitRepository.GitLogEntry;
+import com.google.copybara.profiler.Profiler;
+import com.google.copybara.testing.OptionsBuilder;
+import com.google.copybara.testing.SkylarkTestExecutor;
+import com.google.copybara.testing.git.GitTestUtil;
+import com.google.copybara.testing.profiler.RecordingListener;
+import com.google.copybara.testing.profiler.RecordingListener.EventType;
+import com.google.copybara.util.console.Message.MessageType;
+import com.google.copybara.util.console.testing.TestingConsole;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import com.google.testing.junit.testparameterinjector.TestParameterInjector;
+import com.google.testing.junit.testparameterinjector.TestParameters;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.function.ThrowingRunnable;
+import org.junit.runner.RunWith;
+
+@RunWith(TestParameterInjector.class)
+public class GitMirrorTest {
+
+  public static final String NATIVE_MIRROR_IN_STARLARK_FUNC =
+      """
+      def _native_mirror(ctx):
+           ctx.console.info('Hello this is mirror!')
+           for o,d in ctx.params['refspec'].items():
+               ctx.origin_fetch(refspec = [o])
+               ctx.destination_push(refspec = [o + ':' + d], prune = ctx.params['prune'])
+               return ctx.success()
+
+      def native_mirror(refspec = {'refs/heads/*': 'refs/heads/*'}, prune = False):
+          return core.action(impl = _native_mirror,
+               params = {'refspec': refspec, 'prune' : prune})
+      """;
+  private OptionsBuilder options;
+  private SkylarkTestExecutor skylark;
+  private GitRepository originRepo;
+  private GitRepository destRepo;
+  private Path workdir;
+  private String primaryBranch;
+  private TestingConsole console;
+
+  @Before
+  public void setup() throws Exception {
+    workdir = Files.createTempDirectory("workdir");
+    console = new TestingConsole();
+
+    options =
+        new OptionsBuilder()
+            .setEnvironment(new GitEnvironment(System.getenv()).getEnvironment())
+            .setOutputRootToTmpDir()
+            .setWorkdirToRealTempDir()
+            .setConsole(console);
+
+    options.gitDestination.committerEmail = "copybara@example.com";
+    options.gitDestination.committerName = "Copy Bara";
+
+    originRepo = newBareRepo(Files.createTempDirectory("gitdir"), getGitEnv(),
+        /*verbose=*/true, DEFAULT_TIMEOUT, /*noVerify=*/ false)
+        .withWorkTree(Files.createTempDirectory("worktree"));
+    originRepo.init();
+    destRepo = bareRepo(Files.createTempDirectory("destinationFolder"));
+    destRepo.init();
+
+    skylark = new SkylarkTestExecutor(options);
+
+    Files.write(originRepo.getWorkTree().resolve("test.txt"), "some content".getBytes(UTF_8));
+    originRepo.add().files("test.txt").run();
+    originRepo.simpleCommand("commit", "-m", "first file");
+    originRepo.branch("other").run();
+    primaryBranch = originRepo.getPrimaryBranch();
+  }
+
+  @Test
+  public void testMirror() throws Exception {
+    RecordingListener recordingCallback = installProfiler();
+
+    Migration mirror = createMirrorObj();
+    mirror.run(workdir, ImmutableList.of());
+    String orig = originRepo.simpleCommand("show-ref").getStdout();
+    String dest = destRepo.simpleCommand("show-ref").getStdout();
+    assertThat(dest).isEqualTo(orig);
+
+    recordingCallback
+        .assertMatchesNext(EventType.START, "//copybara")
+        .assertMatchesNext(EventType.START, "//copybara/run/default")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/fetch")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/fetch")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/push")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/push")
+        .assertMatchesNext(EventType.END, "//copybara/run/default");
+  }
+
+  @Test
+  public void testGetDefinitionStack() throws Exception {
+    Migration mirror = createMirrorObj();
+    assertThat(mirror.getDefinitionStack().get(0).location.file()).matches("copy\\.bara\\.sky");
+    assertThat(mirror.getDefinitionStack().get(1).name).matches("mirror");
+  }
+
+  @Test
+  public void testMirrorDryRun() throws Exception {
+    Migration mirror = createMirrorObj();
+    mirror.run(workdir, ImmutableList.of());
+    String orig = originRepo.simpleCommand("show-ref").getStdout();
+    String dest = destRepo.simpleCommand("show-ref").getStdout();
+    assertThat(dest).isEqualTo(orig);
+
+    options.general.dryRunMode = true;
+
+    mirror = createMirrorObj();
+
+    String destOld = destRepo.simpleCommand("show-ref").getStdout();
+
+    Files.write(originRepo.getWorkTree().resolve("test.txt"), "updated content".getBytes(UTF_8));
+    originRepo.add().files("test.txt").run();
+    originRepo.simpleCommand("commit", "-m", "first file");
+
+    mirror.run(workdir, ImmutableList.of());
+    orig = originRepo.simpleCommand("show-ref").getStdout();
+    dest = destRepo.simpleCommand("show-ref").getStdout();
+    assertThat(dest).isNotEqualTo(orig);
+    assertThat(dest).isEqualTo(destOld);
+  }
+
+  /**
+   * Regression that test that if we use a local repo cache we prune when fetching.
+   *
+   * <p>'other' should never be present in destRepo since at the time of the migration it was
+   * not present in the origin and destRepo was empty.
+   */
+  @Test
+  public void testMirrorDeletedOrigin() throws Exception {
+    GitRepository destRepo1 = bareRepo(Files.createTempDirectory("dest1")).init();
+
+    String cfgContent =
+        """
+        git.mirror(
+            name = 'one',
+            origin = 'file://%1$s',
+            destination = 'file://%2$s',
+        )
+        git.mirror(
+            name = 'two',
+            origin = 'file://%1$s',
+            destination = 'file://%3$s',
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(),
+                destRepo1.getGitDir().toAbsolutePath(),
+                destRepo.getGitDir().toAbsolutePath());
+
+    loadMigration(cfgContent, "one").run(workdir, ImmutableList.of());
+    originRepo.simpleCommand("branch", "-D", "other");
+    Mirror mirror = (Mirror) loadMigration(cfgContent, "two");
+
+    assertThat(mirror.getOriginDescription().get("ref")).containsExactly("refs/heads/*");
+    assertThat(mirror.getDestinationDescription().get("ref")).containsExactly("refs/heads/*");
+
+    mirror.run(workdir, ImmutableList.of());
+
+    checkRefDoesntExist("refs/heads/other");
+  }
+
+  @Test
+  public void testMirrorDescription() throws Exception {
+    String cfgContent =
+        """
+        git.mirror(
+            name = 'one',
+            description = 'Do foo with bar',
+            origin = 'https://example.com/foo',
+            destination = 'https://example.com/bar',
+        )
+        """;
+
+    assertThat(loadMigration(cfgContent, "one").getDescription())
+        .isEqualTo("Do foo with bar");
+  }
+
+  private Migration loadMigration(String cfgContent, String name)
+      throws IOException, ValidationException {
+    return skylark.loadConfig(cfgContent).getMigration(name);
+  }
+
+  @Test
+  public void testMirrorNoPrune() throws Exception {
+    GitRepository destRepo1 = bareRepo(Files.createTempDirectory("dest1"));
+    destRepo1.init();
+
+    String cfg =
+        """
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath());
+
+    String other = originRepo.simpleCommand("show-ref", "refs/heads/other", "-s").getStdout();
+    Migration migration = loadMigration(cfg, "default");
+    migration.run(workdir, ImmutableList.of());
+    originRepo.simpleCommand("branch", "-D", "other");
+    migration.run(workdir, ImmutableList.of());
+    assertThat(destRepo.simpleCommand("show-ref", "refs/heads/other", "-s").getStdout())
+        .isEqualTo(other);
+  }
+
+  @Test
+  public void testMirrorPrune() throws Exception {
+    GitRepository destRepo1 = bareRepo(Files.createTempDirectory("dest1"));
+    destRepo1.init();
+
+    String cfg =
+        """
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+            prune = True,
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath());
+
+    Migration migration = loadMigration(cfg, "default");
+    migration.run(workdir, ImmutableList.of());
+    originRepo.simpleCommand("branch", "-D", "other");
+    migration.run(workdir, ImmutableList.of());
+
+    checkRefDoesntExist("refs/heads/other");
+  }
+
+  private GitRepository bareRepo(Path path) {
+    return newBareRepo(
+        path, new GitEnvironment(getGitEnv().getEnvironment()), options.general.isVerbose(),
+        DEFAULT_TIMEOUT, /*noVerify=*/ false);
+  }
+
+  @Test
+  public void testMirrorCustomRefspec() throws Exception {
+    String cfg =
+        """
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+            refspecs = [
+                'refs/heads/%s:refs/heads/origin_primary'
+            ]
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(),
+                destRepo.getGitDir().toAbsolutePath(),
+                primaryBranch);
+    Migration mirror = loadMigration(cfg, "default");
+    mirror.run(workdir, ImmutableList.of());
+    String origPrimary = originRepo.simpleCommand("show-ref", primaryBranch, "-s").getStdout();
+    String dest = destRepo.simpleCommand("show-ref", "origin_primary", "-s").getStdout();
+    assertThat(dest).isEqualTo(origPrimary);
+    checkRefDoesntExist("refs/heads/" + primaryBranch);
+    checkRefDoesntExist("refs/heads/other");
+  }
+
+  @Test
+  public void testMirrorCredentials() throws Exception {
+    Path credentialsFile = Files.createTempFile("credentials", "test");
+    Files.write(credentialsFile, "https://user:SECRET@somehost.com".getBytes(UTF_8));
+    options.git.credentialHelperStorePath = credentialsFile.toString();
+
+    String cfg =
+        """
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath());
+
+    GitRepository repository = ((Mirror) loadMigration(cfg, "default")).getLocalRepo();
+
+    UserPassword result = repository
+        .credentialFill("https://somehost.com");
+
+    assertThat(result.getUsername()).isEqualTo("user");
+    assertThat(result.getPassword_BeCareful()).isEqualTo("SECRET");
+  }
+
+  @Test
+  public void testMirrorCredentials_config() throws Exception {
+    options.git.useConfigCredentials = true;
+    Path credentialsFile = Files.createTempFile("credentials", "test");
+    Files.write(credentialsFile, "https://user:SECRET@somehost.com".getBytes(UTF_8));
+    options.git.credentialHelperStorePath = credentialsFile.toString();
+
+    String cfg =
+        """
+        git.mirror(
+            name = 'default',
+            origin = 'https://origin.com/foo',
+            destination = 'https://destination.com/bar',
+            origin_credentials = credentials.username_password(
+              credentials.static_value('origin@example.com'),
+              credentials.static_secret('origin_password', 'top_secret')),
+            destination_credentials = credentials.username_password(
+              credentials.static_value('destination@example.com'),
+              credentials.static_secret('destination_password', 'confidential'))
+        )
+        """;
+
+    Mirror mirror = (Mirror) loadMigration(cfg, "default");
+    GitRepository repository = mirror.getLocalRepo();
+
+    UserPassword originResult = repository.credentialFill("https://origin.com/foo");
+    assertThat(originResult.getUsername()).isEqualTo("origin@example.com");
+    assertThat(originResult.getPassword_BeCareful()).isEqualTo("top_secret");
+    UserPassword destResult = repository.credentialFill("https://destination.com/bar");
+    assertThat(destResult.getUsername()).isEqualTo("destination@example.com");
+    assertThat(destResult.getPassword_BeCareful()).isEqualTo("confidential");
+    assertThat(mirror.getCredentialDescription()).isNotEmpty();
+  }
+
+  private void checkRefDoesntExist(String ref) throws RepoException {
+    assertThat(destRepo.simpleCommand("show-ref").getStdout()).doesNotContain(" " + ref + "\n");
+  }
+
+  @Test
+  public void testMirrorConflict() throws Exception {
+    Migration mirror = prepareForConflict();
+    ValidationException e =
+        assertThrows(ValidationException.class, () -> mirror.run(workdir, ImmutableList.of()));
+    assertThat(e).hasMessageThat().matches(".*Failed to push to .*"
+        + "because local/origin history is behind destination.*");
+  }
+
+  @Test
+  public void testMirrorNoConflictIfForce() throws Exception {
+    options.setForce(true);
+    Migration mirror = prepareForConflict();
+    mirror.run(workdir, ImmutableList.of());
+  }
+
+  private Migration prepareForConflict() throws IOException, ValidationException, RepoException {
+    String cfg =
+        """
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath());
+    Path otherRepoPath = Files.createTempDirectory("other_repo");
+    GitRepository other =
+        GitRepository.newRepo(
+                /*verbose*/ true,
+                otherRepoPath,
+                new GitEnvironment(getGitEnv().getEnvironment()))
+            .init();
+    Files.write(other.getWorkTree().resolve("test2.txt"), "some content".getBytes(UTF_8));
+    other.add().files("test2.txt").run();
+    other.git(other.getWorkTree(), "commit", "-m", "another file");
+    other.git(other.getWorkTree(), "branch", "other");
+    other.push()
+        .withRefspecs("file://" + destRepo.getGitDir(),
+            ImmutableList.of(other.createRefSpec("+refs/*:refs/*")))
+        .run();
+    return loadMigration(cfg, "default");
+  }
+
+  @Test
+  public void testInvalidMigrationName() {
+    skylark.evalFails(
+        """
+        git.mirror(
+            name = 'foo| bad;name',
+            origin = 'file://%s',
+            destination = 'file://%s',
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath()),
+        ".*Migration name 'foo[|] bad;name' doesn't conform to expected pattern.*");
+  }
+
+  @Test
+  public void testAction() throws Exception {
+    String cfg =
+        """
+        def a1(ctx):
+           ctx.console.info('Hello, this is action1 ' + str(ctx.refs))
+           return ctx.success()
+
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+            action = a1
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath());
+
+    Migration migration = loadMigration(cfg, "default");
+    migration.run(workdir, ImmutableList.of("my_ref"));
+    console.assertThat().onceInLog(MessageType.INFO,
+        "Hello, this is action1 \\[\"my_ref\"\\]");
+  }
+
+  @Test
+  public void testActionFailure() throws Exception {
+    String cfg =
+        """
+        def fail_action(ctx):
+           ctx.console.info('Hello, this is action1')
+           return ctx.error('Something bad happened')
+
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+            action = fail_action,
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath());
+    Migration migration = loadMigration(cfg, "default");
+    ValidationException ve =
+        assertThrows(ValidationException.class, () -> migration.run(workdir, ImmutableList.of()));
+    assertThat(ve).hasMessageThat().contains("Something bad happened");
+    console.assertThat().onceInLog(MessageType.INFO, "Hello, this is action1");
+  }
+
+  /** Starlark version of our native git.mirror implementation */
+  @Test
+  public void testDefaultMirrorInStarlark() throws Exception {
+    String cfg =
+        """
+        %1$s
+        git.mirror(
+            name = 'default',
+            origin = 'file://%2$s',
+            destination = 'file://%3$s',
+            refspecs = [
+               'refs/heads/%4$s:refs/heads/origin_primary',
+            ],
+            action = native_mirror(refspec = {
+               'refs/heads/%4$s':'refs/heads/origin_primary'
+            }),
+        )
+        """
+            .formatted(
+                NATIVE_MIRROR_IN_STARLARK_FUNC,
+                originRepo.getGitDir().toAbsolutePath(),
+                destRepo.getGitDir().toAbsolutePath(),
+                primaryBranch);
+    Migration mirror = loadMigration(cfg, "default");
+    mirror.run(workdir, ImmutableList.of());
+    String origPrimary = originRepo.simpleCommand("show-ref", primaryBranch, "-s").getStdout();
+    String dest = destRepo.simpleCommand("show-ref", "origin_primary", "-s").getStdout();
+    assertThat(dest).isEqualTo(origPrimary);
+    checkRefDoesntExist("refs/heads/" + primaryBranch);
+    checkRefDoesntExist("refs/heads/other");
+  }
+
+  @Test
+  public void testDefaultMirrorInStarlark_invalid_origin() throws Exception {
+    String cfg =
+        """
+        %1$s
+        git.mirror(
+            name = 'default',
+            origin = 'file://%2$s',
+            destination = 'file://%3$s',
+            refspecs = [
+               'refs/heads/%4$s:refs/heads/origin_primary',
+            ],
+            action = native_mirror(refspec = {
+               'refs/heads/INVALID':'refs/heads/origin_primary'
+            }),
+        )
+        """
+            .formatted(
+                NATIVE_MIRROR_IN_STARLARK_FUNC,
+                originRepo.getGitDir().toAbsolutePath(),
+                destRepo.getGitDir().toAbsolutePath(),
+                primaryBranch);
+    Migration mirror = loadMigration(cfg, "default");
+    ValidationException ve = assertThrows(ValidationException.class,
+        () -> mirror.run(workdir, ImmutableList.of()));
+    assertThat(ve).hasMessageThat().contains(
+        "Action tried to fetch from origin one or more refspec not covered by git.mirror");
+  }
+
+  @Test
+  public void testDefaultMirrorInStarlark_invalid_destination() throws Exception {
+    String cfg =
+        """
+        %1$s
+        git.mirror(
+            name = 'default',
+            origin = 'file://%2$s',
+            destination = 'file://%3$s',
+            refspecs = [
+               'refs/heads/%4$s:refs/heads/origin_primary',
+            ],
+            action = native_mirror(refspec = {
+               'refs/heads/%4$s':'refs/heads/INVALID'
+            }),
+        )
+        """
+            .formatted(
+                NATIVE_MIRROR_IN_STARLARK_FUNC,
+                originRepo.getGitDir().toAbsolutePath(),
+                destRepo.getGitDir().toAbsolutePath(),
+                primaryBranch);
+    Migration mirror = loadMigration(cfg, "default");
+    ValidationException ve = assertThrows(ValidationException.class,
+        () -> mirror.run(workdir, ImmutableList.of()));
+    assertThat(ve).hasMessageThat().contains(
+        "Action tried to push to destination one or more refspec not covered by git.mirror");
+  }
+
+  @Test
+  public void testMerge() throws Exception {
+    Migration mirror = mergeInit("FF", /* partialFetch= */ false);
+
+    GitLogEntry destChange = repoChange(destRepo, "some_file", "Content", "destination only");
+    GitLogEntry originChange = repoChange(originRepo, "some_other_file", "Content", "new change");
+
+    mirror.run(workdir, ImmutableList.of());
+
+    GitLogEntry merge = lastChange(destRepo, primaryBranch);
+
+    // It is a merge
+    assertThat(merge.parents())
+        .containsExactly(destChange.commit(), originChange.commit());
+
+    // OSS branch is updated with origin version.
+    assertThat(lastChange(destRepo, "oss").commit()).isEqualTo(originChange.commit());
+  }
+
+  @Test
+  @TestParameters({
+    "{partialFetch: true, expectedConfigMatcher: \"(remote..*.partialclonefilter blob:none((.|\\n"
+        + ")*))\"}",
+    "{partialFetch: false, expectedConfigMatcher: \"^$\"}"
+  })
+  public void testMirrorWithPartialFetch_toggleOnOff(
+      boolean partialFetch, String expectedConfigMatcher)
+      throws IOException, RepoException, ValidationException {
+    Migration mirror = mergeInit("NO_FF", /* partialFetch= */ partialFetch);
+
+    GitLogEntry originChange = repoChange(originRepo, "testfile", "test content", "commit");
+
+    mirror.run(workdir, ImmutableList.of());
+
+    GitLogEntry merge = lastChange(destRepo, primaryBranch);
+
+    assertThat(
+            options
+                .git
+                .cachedBareRepoForUrl(
+                    "file://" + originRepo.getGitDir().toAbsolutePath().toString())
+                .gitAllowNonZeroExit(
+                    new byte[] {},
+                    ImmutableList.of("config", "--get-regexp", "remote..*.partialclonefilter"),
+                    Duration.ofMinutes(15))
+                .getStdout())
+        .matches(expectedConfigMatcher);
+  }
+
+  @Test
+  public void testSuccessfulMergeWithoutFastForwarding()
+      throws IOException, RepoException, ValidationException {
+    Migration mirror = mergeInit("NO_FF", /* partialFetch= */ false);
+
+    GitLogEntry originChange = repoChange(originRepo, "testfile", "test content", "commit");
+
+    mirror.run(workdir, ImmutableList.of());
+
+    GitLogEntry merge = lastChange(destRepo, primaryBranch);
+
+    // merge has more than 1 parent from not fast forwarding
+    assertThat(merge.parents().size()).isGreaterThan(1);
+    assertThat(destRepo.simpleCommand("log").getStdout()).contains("Merge branch");
+
+    // expecting the destination repo to have a merge commit that the origin does not
+    assertThat(lastChange(destRepo, primaryBranch).commit())
+        .isNotEqualTo(lastChange(originRepo, primaryBranch).commit());
+  }
+
+  @Test
+  @TestParameters({"{fastForwardOption: \"FF\"}", "{fastForwardOption: \"FF_ONLY\"}"})
+  public void testSuccessfulMergeWithFastForwarding(String fastForwardOption)
+      throws IOException, RepoException, ValidationException {
+    Migration mirror = mergeInit(fastForwardOption, /* partialFetch= */ false);
+    GitRevision firstCommit = lastChange(destRepo, primaryBranch).commit();
+    GitLogEntry originChange = repoChange(originRepo, "testfile", "test content", "commit");
+
+    mirror.run(workdir, ImmutableList.of());
+
+    GitLogEntry merge = lastChange(destRepo, primaryBranch);
+
+    assertThat(merge.parents()).containsExactly(firstCommit);
+
+    // OSS branch is updated with origin version.
+    assertThat(lastChange(destRepo, "oss").commit()).isEqualTo(originChange.commit());
+  }
+
+  @Test
+  public void testRebase() throws Exception {
+    options.gitDestination.committerEmail = "internal_system@example.com";
+    options.gitDestination.committerName = "Internal System";
+
+    String cfg =
+        """
+        def _rebase(ctx):
+             ctx.destination_fetch(refspec = ['refs/heads/%1$s'])
+             exist = ctx.destination_fetch(refspec = ['refs/heads/internal'])
+             ctx.origin_fetch(refspec = ['refs/heads/%1$s'])
+             if exist:
+                 result = ctx.rebase(branch = 'internal', upstream = '%1$s')
+                 if result.error:
+                     return ctx.error('Conflict rebasing change')
+             else:
+                 ctx.create_branch('internal', starting_point = '%1$s')
+             ctx.destination_push(refspec = ['+refs/heads/internal'])
+             ctx.destination_push(refspec = ['refs/heads/%1$s'])
+             return ctx.success()
+
+        git.mirror(
+            name = 'default',
+            origin = 'file://%2$s',
+            destination = 'file://%3$s',
+            refspecs = ['refs/heads/*:refs/heads/*'],
+            action = _rebase,
+        )
+        """
+            .formatted(
+                primaryBranch,
+                originRepo.getGitDir().toAbsolutePath(),
+                destRepo.getGitDir().toAbsolutePath());
+    Migration mirror1 = loadMigration(cfg, "default");
+    mirror1.run(workdir, ImmutableList.of());
+    GitLogEntry originChange = repoChange(originRepo, "some_other_file", "Content", "new change");
+    GitRepository dest = destRepo.withWorkTree(Files.createTempDirectory("dest"));
+    dest.forceCheckout("internal");
+    GitLogEntry destChange = repoChange(dest, "some_file", "Content", "destination only");
+    mirror1.run(workdir, ImmutableList.of());
+
+    ImmutableList<GitLogEntry> log = destRepo.log("internal").run();
+    assertThat(log.get(0).body()).contains(destChange.body());
+    assertThat(log.get(0).committer()).isEqualTo(options.gitDestination.getCommitter());
+    assertThat(log.get(1).commit()).isEqualTo(originChange.commit());
+  }
+
+  @Test
+  public void testReferences() throws Exception {
+    String cfg =
+        """
+        def test(ctx):
+             ctx.origin_fetch(refspec = ['refs/heads/*:refs/heads/origin/*'])
+             for k in ctx.references().keys():
+                 ctx.console.info('REF: ' + k)
+             for k in ctx.references(['refs/heads/origin/fo*']).keys():
+                 ctx.console.info('REFSPEC: ' + k)
+             return ctx.success()
+
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+            action = test,
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath());
+    Migration mirror1 = loadMigration(cfg, "default");
+    originRepo.branch("foo1").run();
+    originRepo.branch("foo2").run();
+    mirror1.run(workdir, ImmutableList.of());
+
+    console.assertThat().onceInLog(MessageType.INFO, "REF: refs/heads/origin/" + primaryBranch);
+    console.assertThat().onceInLog(MessageType.INFO, "REF: refs/heads/origin/foo1");
+    console.assertThat().onceInLog(MessageType.INFO, "REF: refs/heads/origin/foo2");
+    console.assertThat().onceInLog(MessageType.INFO, "REF: refs/heads/origin/other");
+
+    console.assertThat().onceInLog(MessageType.INFO, "REFSPEC: refs/heads/origin/foo1");
+    console.assertThat().onceInLog(MessageType.INFO, "REFSPEC: refs/heads/origin/foo2");
+    console
+        .assertThat()
+        .timesInLog(0, MessageType.INFO, "REFSPEC: refs/heads/origin/" + primaryBranch);
+    console
+        .assertThat()
+        .timesInLog(0, MessageType.INFO, "REFSPEC: refs/heads/origin/other");
+  }
+
+  @Test
+  public void testCreateBranch() throws Exception {
+    String cfg =
+        """
+        def test(ctx):
+             ctx.origin_fetch(refspec = ['refs/heads/*:refs/heads/*'])
+             ctx.create_branch('create_head')
+             ctx.create_branch('create_old', 'HEAD~1')
+             for k,v in ctx.references(['refs/heads/create*']).items():
+                 ctx.console.info('REF: ' + k + ':' + v)
+             return ctx.success()
+
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+            action = test,
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath());
+    Migration mirror1 = loadMigration(cfg, "default");
+    GitLogEntry one = repoChange(originRepo, "some_other_file", "one", "new change");
+    GitLogEntry two = repoChange(originRepo, "some_other_file", "two", "new change");
+
+    mirror1.run(workdir, ImmutableList.of());
+
+    console
+        .assertThat()
+        .onceInLog(MessageType.INFO, "REF: refs/heads/create_old:" + one.commit().getHash());
+    console
+        .assertThat()
+        .onceInLog(MessageType.INFO, "REF: refs/heads/create_head:" + two.commit().getHash());
+  }
+
+  @Test
+  public void testDefaultMirrorWithPushOptions() throws Exception {
+    // default mirror when user doesn't set actions
+    final Migration mirror = createMirrorObj();
+    options.git.gitPushOptions = ImmutableList.of("example_push_option");
+    RepoException expectedException =
+        assertThrows(RepoException.class, () -> mirror.run(workdir, ImmutableList.of()));
+    assertThat(expectedException).hasMessageThat().contains("--push-option=example_push_option");
+    // expected, this folder doesn't support push options
+    assertThat(expectedException)
+        .hasMessageThat()
+        .contains("the receiving end does not support push options");
+  }
+
+  @Test
+  public void testPushWithAllowedPushOptionsButUnsupportedAtDestination() throws Exception {
+    String cfg =
+        """
+        def test(ctx):
+             ctx.origin_fetch(refspec = ['refs/heads/*:refs/heads/*'])
+             ctx.destination_push(['refs/heads/*:refs/heads/*'], push_options = ['example_push_option'])
+             return ctx.success()
+
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+            action = test,
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath());
+    Migration mirror = loadMigration(cfg, "default");
+    GitLogEntry one = repoChange(originRepo, "some_other_file", "one", "new change");
+    RepoException expectedException =
+        assertThrows(RepoException.class, () -> mirror.run(workdir, ImmutableList.of()));
+    assertThat(expectedException).hasMessageThat().contains("--push-option=example_push_option");
+    // expected, this folder doesn't support push options
+    assertThat(expectedException)
+        .hasMessageThat()
+        .contains("the receiving end does not support push options");
+  }
+
+  @Test
+  public void testMirrorWithApiHandles() throws Exception {
+    String cfg =
+        """
+        def test(ctx):
+            origin_api = ctx.origin_api
+            destination_api = ctx.destination_api
+            if type(origin_api) != 'gerrit_api_obj':
+                fail('this was not supposed to happen: expected gerrit_api_obj, but got ' + type(origin_api))
+            if type(destination_api) != 'github_api_obj':
+                fail('this was not supposed to happen: expected github_api_obj, but got ' + type(destination_api))
+            return ctx.success()
+
+        git.mirror(
+            name = 'default',
+            origin = 'https://copybara.googlesource.com/copybara/',
+            destination = 'https://github.com/google/copybara',
+            action = test,
+        )
+        """;
+    Migration mirror = loadMigration(cfg, "default");
+    mirror.run(workdir, ImmutableList.of());
+  }
+
+  @Test
+  public void testMirrorWithApiHandles_noInferredApiHandle() throws Exception {
+    String cfg =
+        """
+        def test(ctx):
+            origin_api = ctx.origin_api
+            destination_api = ctx.destination_api
+            if type(origin_api) == 'NoneType' and type(destination_api) == 'NoneType':
+                return ctx.success()
+            fail('this was not supposed to happen: expected NoneType, but got ' + type(origin_api) + ' and ' + type(destination_api))
+
+        git.mirror(
+            name = 'default',
+            origin = 'not.github.or.gerrit.com',
+            destination = 'foo.bar.baz.com',
+            action = test,
+        )
+        """;
+    Migration mirror = loadMigration(cfg, "default");
+    mirror.run(workdir, ImmutableList.of());
+  }
+
+  @Test
+  public void testCherrypick() throws Exception {
+    String primaryBranch = originRepo.getPrimaryBranch();
+    String cfg =
+        """
+        def test(ctx):
+             ctx.origin_fetch(refspec = ['refs/heads/*:refs/heads/*'])
+             ctx.create_branch('my_branch', starting_point = 'HEAD~3')
+             ctx.cherry_pick('my_branch', ['HEAD..%s'])
+             ctx.destination_push(['refs/heads/*:refs/heads/*'])
+             return ctx.success()
+
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+            action = test,
+        )
+        """
+            .formatted(
+                primaryBranch,
+                originRepo.getGitDir().toAbsolutePath(),
+                destRepo.getGitDir().toAbsolutePath());
+    Migration mirror1 = loadMigration(cfg, "default");
+    GitLogEntry one = repoChange(originRepo, "some_other_file", "1", "one");
+    GitLogEntry two = repoChange(originRepo, "some_other_file", "2", "two");
+    GitLogEntry three = repoChange(originRepo, "some_other_file", "3", "three");
+    GitLogEntry four = repoChange(originRepo, "some_other_file", "4", "four");
+
+    mirror1.run(workdir, ImmutableList.of());
+
+    ImmutableList<GitLogEntry> logCp = destRepo.log("my_branch").run();
+    ImmutableList<GitLogEntry> log = destRepo.log(primaryBranch).run();
+
+    assertThat(logCp.get(0).body())
+        .containsMatch("four(.|\n)*" + "cherry picked from commit " + four.commit().getHash());
+    assertThat(logCp.get(0).commit().getHash()).isNotEqualTo(four.commit().getHash());
+
+    assertThat(logCp.get(1).body())
+        .containsMatch("three(.|\n)*" + "cherry picked from commit " + three.commit().getHash());
+    assertThat(logCp.get(1).commit().getHash()).isNotEqualTo(three.commit().getHash());
+
+    assertThat(logCp.get(2).body())
+        .containsMatch("two(.|\n)*" + "cherry picked from commit " + two.commit().getHash());
+    assertThat(logCp.get(2).commit().getHash()).isNotEqualTo(two.commit().getHash());
+
+    assertThat(logCp.get(3).body()).containsMatch("one");
+    assertThat(logCp.get(3).commit().getHash()).isEqualTo(one.commit().getHash());
+  }
+
+  @Test
+  public void testActionForcePushFlag() throws Exception {
+    String primaryBranch = originRepo.getPrimaryBranch();
+    String cfg =
+        """
+        def test(ctx):
+             ctx.origin_fetch(refspec = ['refs/heads/*:refs/heads/*'])
+             ctx.destination_push(['refs/heads/*:refs/heads/*'])
+             return ctx.success()
+
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+            action = test,
+        )
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(), destRepo.getGitDir().toAbsolutePath());
+    repoChange(originRepo, "some_other_file", "1", "one");
+    GitLogEntry two = repoChange(originRepo, "some_other_file", "2", "two");
+    repoChange(originRepo, "some_other_file", "3", "three");
+
+    options.general.setForceForTest(true);
+    Migration mirror = loadMigration(cfg, "default");
+
+    mirror.run(workdir, ImmutableList.of());
+    originRepo.simpleCommand("reset", "--hard", "HEAD~1");
+    mirror.run(workdir, ImmutableList.of());
+
+    // We pushed HEAD~1 to the destination:
+    assertEquals(destRepo.getHeadRef().getHash(), two.commit().getHash());
+  }
+
+  @Test
+  @TestParameters({"{fastForwardOption: \"FF\"}", "{fastForwardOption: \"FF_ONLY\"}"})
+  public void testMergeConflict(String fastForwardOption) throws Exception {
+    Migration mirror = mergeInit(fastForwardOption, /* partialFetch= */ false);
+
+    GitLogEntry destChange = repoChange(destRepo, "some_file", "Hello", "destination only");
+    GitLogEntry originChange = repoChange(originRepo, "some_file", "Bye", "new change");
+
+    assertThat((assertThrows(ValidationException.class, new ThrowingRunnable() {
+      @Override
+      public void run() throws Throwable {
+        mirror.run(workdir, ImmutableList.of());
+      }
+    }))).hasMessageThat().contains("Conflict merging refs/heads/" + primaryBranch);
+  }
+
+  @Test
+  public void testMirror_withReftableFormat_branches() throws Exception {
+    options.git.gitRefFormat = GitRefFormat.REFTABLE;
+    Path originGitDir = Files.createTempDirectory("reftable_origin_gitdir");
+    Path originWorkTree = Files.createTempDirectory("reftable_origin_worktree");
+    GitRepository origin =
+        newBareRepo(
+                originGitDir,
+                getGitEnv(),
+                /* verbose= */ true,
+                DEFAULT_TIMEOUT,
+                /* noVerify= */ false)
+            .withWorkTree(originWorkTree);
+    origin.init((GitRevision.GitHashAlgorithm) null, GitRefFormat.REFTABLE);
+    Path destGitDir = Files.createTempDirectory("reftable_dest_gitdir");
+    GitRepository dest =
+        GitRepository.newBareRepo(
+            destGitDir, getGitEnv(), /* verbose= */ true, DEFAULT_TIMEOUT, /* noVerify= */ false);
+    dest.init((GitRevision.GitHashAlgorithm) null, GitRefFormat.REFTABLE);
+
+    Files.write(originWorkTree.resolve("file.txt"), "hello".getBytes(UTF_8));
+    origin.add().files("file.txt").run();
+    origin.simpleCommand("commit", "-m", "first commit");
+    origin.simpleCommand("branch", "feature-1");
+    origin.simpleCommand("branch", "feature-2");
+
+    Migration mirror =
+        loadMigration(
+            String.format(
+                """
+                git.mirror(
+                    name = 'mirror',
+                    origin = '%s',
+                    destination = '%s',
+                    refspecs = ['refs/heads/*:refs/heads/*'],
+                )
+                """,
+                "file://" + originGitDir.toAbsolutePath(), "file://" + destGitDir.toAbsolutePath()),
+            "mirror");
+
+    mirror.run(workdir, ImmutableList.of());
+
+    String destFeature1 = dest.simpleCommand("show-ref", "refs/heads/feature-1").getStdout().trim();
+    String destFeature2 = dest.simpleCommand("show-ref", "refs/heads/feature-2").getStdout().trim();
+    assertThat(destFeature1).isNotEmpty();
+    assertThat(destFeature2).isNotEmpty();
+    assertThat(dest.isReftable()).isTrue();
+  }
+
+  @Test
+  public void testMirror_withReftableFormat_tags() throws Exception {
+    options.git.gitRefFormat = GitRefFormat.REFTABLE;
+    Path originGitDir = Files.createTempDirectory("reftable_origin_gitdir");
+    Path originWorkTree = Files.createTempDirectory("reftable_origin_worktree");
+    GitRepository origin =
+        newBareRepo(
+                originGitDir,
+                getGitEnv(),
+                /* verbose= */ true,
+                DEFAULT_TIMEOUT,
+                /* noVerify= */ false)
+            .withWorkTree(originWorkTree);
+    origin.init((GitRevision.GitHashAlgorithm) null, GitRefFormat.REFTABLE);
+    Path destGitDir = Files.createTempDirectory("reftable_dest_gitdir");
+    GitRepository dest =
+        GitRepository.newBareRepo(
+            destGitDir, getGitEnv(), /* verbose= */ true, DEFAULT_TIMEOUT, /* noVerify= */ false);
+    dest.init((GitRevision.GitHashAlgorithm) null, GitRefFormat.REFTABLE);
+
+    Files.write(originWorkTree.resolve("file.txt"), "hello".getBytes(UTF_8));
+    origin.add().files("file.txt").run();
+    origin.simpleCommand("commit", "-m", "first commit");
+    origin.simpleCommand("tag", "v1.0");
+
+    Migration mirror =
+        loadMigration(
+            String.format(
+                """
+                git.mirror(
+                    name = 'mirror',
+                    origin = '%s',
+                    destination = '%s',
+                    refspecs = ['refs/tags/*:refs/tags/*'],
+                )
+                """,
+                "file://" + originGitDir.toAbsolutePath(), "file://" + destGitDir.toAbsolutePath()),
+            "mirror");
+
+    mirror.run(workdir, ImmutableList.of());
+
+    String destTag = dest.simpleCommand("show-ref", "refs/tags/v1.0").getStdout().trim();
+    assertThat(destTag).isNotEmpty();
+    assertThat(dest.isReftable()).isTrue();
+  }
+
+  private Migration mergeInit(String fastForwardOption, boolean partialFetch)
+      throws IOException, ValidationException, RepoException {
+    String partialFetchString = partialFetch ? "True" : "False";
+    String cfg =
+        """
+        def _merger(ctx):
+             ctx.console.info('Hello this is mirror!')
+             branch = ctx.params['branch']
+             oss_branch = ctx.params['oss_branch']
+             ctx.origin_fetch(partial_fetch=%1$s, refspec = [branch + ':refs/heads/copybara/origin_fetch'])
+             exist = ctx.destination_fetch(partial_fetch=%1$s, refspec = [branch + ':refs/heads/copybara/destination_fetch'])
+             if exist:
+                 result = ctx.merge(branch = 'copybara/destination_fetch',
+                      commits = ['refs/heads/copybara/origin_fetch'],
+        fast_forward = '%2$s')
+                 if result.error:
+                     return ctx.error('Conflict merging ' + branch + ' into destination: ' + result.error_msg)
+                 ctx.destination_push(refspec = ['refs/heads/copybara/destination_fetch:' + branch])
+             else:
+                 ctx.destination_push(refspec = ['refs/heads/copybara/origin_fetch:' + branch])
+             if oss_branch:
+                 ctx.destination_push(refspec = ['refs/heads/copybara/origin_fetch:' + oss_branch])
+             return ctx.success()
+
+        def merger(branch, oss_branch = None):
+            return core.action(impl = _merger,         params = {'branch': branch, 'oss_branch' : oss_branch})
+
+        git.mirror(
+            name = 'default',
+            origin = 'file://%3$s',
+            destination = 'file://%4$s',
+            refspecs = [
+               'refs/heads/%5$s:refs/heads/%5$s',
+               'refs/heads/%5$s:refs/heads/oss',
+            ],
+            action = merger('refs/heads/%5$s', oss_branch = 'refs/heads/oss'),
+        )
+        """
+            .formatted(
+                partialFetchString,
+                fastForwardOption,
+                originRepo.getGitDir().toAbsolutePath(),
+                destRepo.getGitDir().toAbsolutePath(),
+                primaryBranch);
+    Migration mirror = loadMigration(cfg, "default");
+    mirror.run(workdir, ImmutableList.of());
+    String origPrimary = originRepo.simpleCommand("show-ref", primaryBranch, "-s").getStdout();
+
+    assertThat(destRepo.simpleCommand("show-ref", primaryBranch, "-s").getStdout())
+        .isEqualTo(origPrimary);
+    assertThat(destRepo.simpleCommand("show-ref", "oss", "-s").getStdout()).isEqualTo(origPrimary);
+    return mirror;
+  }
+
+  @CanIgnoreReturnValue
+  private GitLogEntry repoChange(GitRepository repo, String path, String content, String msg)
+      throws IOException, RepoException {
+    GitRepository withWorkdir =
+        repo.getWorkTree() != null ? repo
+                                   : repo.withWorkTree(Files.createTempDirectory("test"));
+
+    GitTestUtil.writeFile(withWorkdir.getWorkTree(), path, content);
+    withWorkdir.add().all().run();
+    withWorkdir.simpleCommand("commit", "-m", msg);
+    return lastChange(withWorkdir, "HEAD");
+  }
+
+  private GitLogEntry lastChange(GitRepository withWorkdir, String ref) throws RepoException {
+    return withWorkdir.log(ref).withLimit(1).run().get(0);
+  }
+
+  @Test
+  public void mirror_alreadyInSync_skipsFetchAndPush() throws Exception {
+    options.general.setTemporaryFeaturesForTest(
+        ImmutableMap.of(Mirror.GIT_MIRROR_CHECK_ALREADY_IN_SYNC, "true"));
+    Migration mirror = createMirrorObj();
+    mirror.run(workdir, ImmutableList.of());
+
+    RecordingListener recordingCallback = installProfiler();
+    mirror.run(workdir, ImmutableList.of());
+
+    recordingCallback
+        .assertMatchesNext(EventType.START, "//copybara")
+        .assertMatchesNext(EventType.START, "//copybara/run/default")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/ls_remote")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/ls_remote")
+        .assertMatchesNext(EventType.END, "//copybara/run/default");
+    console
+        .assertThat()
+        .onceInLog(
+            MessageType.INFO,
+            "Origin and destination refs are in sync for default. Skipping fetch and push.");
+  }
+
+  @Test
+  public void mirror_originUpdated_performsFetchAndPush() throws Exception {
+    options.general.setTemporaryFeaturesForTest(
+        ImmutableMap.of(Mirror.GIT_MIRROR_CHECK_ALREADY_IN_SYNC, "true"));
+    Migration mirror = createMirrorObj();
+    mirror.run(workdir, ImmutableList.of());
+    // Modify a file in the origin and commit so the origin and destination are out of sync.
+    Files.write(originRepo.getWorkTree().resolve("test2.txt"), "new content".getBytes(UTF_8));
+    originRepo.add().files("test2.txt").run();
+    originRepo.simpleCommand("commit", "-m", "second file");
+
+    RecordingListener recordingCallback = installProfiler();
+    mirror.run(workdir, ImmutableList.of());
+
+    recordingCallback
+        .assertMatchesNext(EventType.START, "//copybara")
+        .assertMatchesNext(EventType.START, "//copybara/run/default")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/ls_remote")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/ls_remote")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/fetch")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/fetch")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/push")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/push")
+        .assertMatchesNext(EventType.END, "//copybara/run/default");
+    String orig = originRepo.simpleCommand("show-ref").getStdout();
+    String dest = destRepo.simpleCommand("show-ref").getStdout();
+    assertThat(dest).isEqualTo(orig);
+  }
+
+  @Test
+  public void mirror_pruneTrue_danglingDestRef_triggersFetchAndPush() throws Exception {
+    options.general.setTemporaryFeaturesForTest(
+        ImmutableMap.of(Mirror.GIT_MIRROR_CHECK_ALREADY_IN_SYNC, "true"));
+    Migration mirror = createMirrorObj(/* prune= */ true);
+    mirror.run(workdir, ImmutableList.of());
+    // Inject an extra branch into destination only (simulates a branch deleted on origin).
+    String primarySha = destRepo.simpleCommand("rev-parse", primaryBranch).getStdout().trim();
+    destRepo.simpleCommand("update-ref", "refs/heads/dangling", primarySha);
+
+    // Because prune=true and destination has a dangling ref, fetch and push should execute to prune
+    // the dangling ref.
+    RecordingListener recordingCallback = installProfiler();
+    mirror.run(workdir, ImmutableList.of());
+
+    recordingCallback
+        .assertMatchesNext(EventType.START, "//copybara")
+        .assertMatchesNext(EventType.START, "//copybara/run/default")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/ls_remote")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/ls_remote")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/fetch")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/fetch")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/push")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/push")
+        .assertMatchesNext(EventType.END, "//copybara/run/default");
+    String orig = originRepo.simpleCommand("show-ref").getStdout();
+    String dest = destRepo.simpleCommand("show-ref").getStdout();
+    assertThat(dest).isEqualTo(orig);
+  }
+
+  @Test
+  public void mirror_pruneFalse_danglingDestRef_skipsFetchAndPush() throws Exception {
+    options.general.setTemporaryFeaturesForTest(
+        ImmutableMap.of(Mirror.GIT_MIRROR_CHECK_ALREADY_IN_SYNC, "true"));
+    Migration mirror = createMirrorObj(/* prune= */ false);
+    mirror.run(workdir, ImmutableList.of());
+    // Inject an extra branch into destination only.
+    String primarySha = destRepo.simpleCommand("rev-parse", primaryBranch).getStdout().trim();
+    destRepo.simpleCommand("update-ref", "refs/heads/extra", primarySha);
+
+    // Because prune=false, extra destination refs are permitted, so fetch and push should be
+    // skipped.
+    RecordingListener recordingCallback = installProfiler();
+    mirror.run(workdir, ImmutableList.of());
+
+    recordingCallback
+        .assertMatchesNext(EventType.START, "//copybara")
+        .assertMatchesNext(EventType.START, "//copybara/run/default")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/ls_remote")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/ls_remote")
+        .assertMatchesNext(EventType.END, "//copybara/run/default");
+    console
+        .assertThat()
+        .onceInLog(
+            MessageType.INFO,
+            "Origin and destination refs are in sync for default. Skipping fetch and push.");
+  }
+
+  @Test
+  public void mirror_alreadyInSync_featureFlagDisabled_performsFetchAndPush() throws Exception {
+    options.general.setTemporaryFeaturesForTest(
+        ImmutableMap.of(Mirror.GIT_MIRROR_CHECK_ALREADY_IN_SYNC, "false"));
+
+    Migration mirror = createMirrorObj();
+    mirror.run(workdir, ImmutableList.of());
+
+    RecordingListener recordingCallback = installProfiler();
+    mirror.run(workdir, ImmutableList.of());
+
+    recordingCallback
+        .assertMatchesNext(EventType.START, "//copybara")
+        .assertMatchesNext(EventType.START, "//copybara/run/default")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/fetch")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/fetch")
+        .assertMatchesNext(EventType.START, "//copybara/run/default/push")
+        .assertMatchesNext(EventType.END, "//copybara/run/default/push")
+        .assertMatchesNext(EventType.END, "//copybara/run/default");
+    console
+        .assertThat()
+        .matchesNextSkipAhead(MessageType.PROGRESS, "Fetching from.*")
+        .matchesNextSkipAhead(MessageType.PROGRESS, "Pushing to.*")
+        .timesInLog(
+            0,
+            MessageType.INFO,
+            "Origin and destination refs are in sync for default. Skipping fetch and push.");
+  }
+
+  private Migration createMirrorObj() throws IOException, ValidationException {
+    return createMirrorObj(/* prune= */ false);
+  }
+
+  private Migration createMirrorObj(boolean prune) throws IOException, ValidationException {
+    return loadMigration(
+        """
+        git.mirror(
+            name = 'default',
+            origin = 'file://%s',
+            destination = 'file://%s',
+            prune = %s)
+        """
+            .formatted(
+                originRepo.getGitDir().toAbsolutePath(),
+                destRepo.getGitDir().toAbsolutePath(),
+                prune ? "True" : "False"),
+        "default");
+  }
+
+  private RecordingListener installProfiler() {
+    RecordingListener recordingCallback = new RecordingListener();
+    Profiler profiler = new Profiler(new FakeTicker());
+    profiler.init(ImmutableList.of(recordingCallback));
+    options.general.withProfiler(profiler);
+    return recordingCallback;
+  }
+}
